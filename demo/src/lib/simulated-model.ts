@@ -28,19 +28,19 @@ export function simulatedModel({ mangle }: { mangle: boolean }): CreateFn {
       ids.length > 0 ? `Identifiers on file: ${ids.join(", ")}.` : "No other identifiers were masked.",
       `I'll open a follow-up task so the adjuster confirms the details with ${who}.`,
     ];
-    let text = `[Simulated model] ${sentences.join(" ")}`;
+    let summary = `[Simulated model] ${sentences.join(" ")}`;
     if (mangle && t.PERSON) {
-      const i = text.lastIndexOf(t.PERSON);
-      text = text.slice(0, i) + t.PERSON.slice(1).toLowerCase() + text.slice(i + t.PERSON.length);
+      const i = summary.lastIndexOf(t.PERSON);
+      summary = summary.slice(0, i) + t.PERSON.slice(1).toLowerCase() + summary.slice(i + t.PERSON.length);
     }
 
+    // Same shape as the live model: the summary travels inside the tool call.
     const content: Block[] = [
-      { type: "text", text },
       {
         type: "tool_use",
         id: "toolu_simulated_1",
         name: "create_follow_up_task",
-        input: { subject: `Confirm loss details with ${who}`, contact: contact ?? "not given", due_in_days: 2 },
+        input: { summary, subject: `Confirm loss details with ${who}`, contact: contact ?? "not given", due_in_days: 2 },
       },
     ];
     const message: DemoMessage = { model: "simulated", content, stop_reason: "tool_use" };

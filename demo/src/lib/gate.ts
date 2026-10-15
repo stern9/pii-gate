@@ -44,7 +44,7 @@ export const CATEGORIES: readonly BuiltInCategory[] = BUILT_IN_CATEGORIES;
 
 export const SYSTEM_PROMPT = `You help insurance claims adjusters triage incoming notes.
 Personal details in the note have been replaced with placeholders such as {{PERSON_1}} or {{PHONE_1}}. Use a placeholder exactly as written whenever you refer to that detail, and never guess what it stands for.
-Write a summary of two or three sentences for the adjuster, then call create_follow_up_task once.`;
+Call create_follow_up_task once. Put a summary of two or three sentences for the adjuster in its summary field.`;
 
 export const FOLLOW_UP_TOOL: Anthropic.Beta.BetaTool = {
   name: "create_follow_up_task",
@@ -52,11 +52,12 @@ export const FOLLOW_UP_TOOL: Anthropic.Beta.BetaTool = {
   input_schema: {
     type: "object",
     properties: {
+      summary: { type: "string", description: "Two or three sentences for the adjuster about what the note says." },
       subject: { type: "string", description: "One line: what to do and with whom." },
       contact: { type: "string", description: "How to reach the person, if the note gives a way." },
       due_in_days: { type: "integer", description: "Business days until the task is due." },
     },
-    required: ["subject", "contact", "due_in_days"],
+    required: ["summary", "subject", "contact", "due_in_days"],
     additionalProperties: false,
   },
   strict: true,
@@ -86,8 +87,11 @@ export type GateRun =
     }
   | {
       ok: false;
-      /** Error class name and, for a block, the categories. Never values. */
-      error: { name: string; blockedCategories?: string[] };
+      /**
+       * Error class name, the categories for a block, and whether the model
+       * call itself failed (the SDK's message is never passed on). Never values.
+       */
+      error: { name: string; blockedCategories?: string[]; upstream?: boolean };
       audit?: AuditRecord;
     };
 
@@ -100,11 +104,17 @@ export async function runGate(note: string, policy: Policy, model: string, creat
   const records: AuditRecord[] = [];
   let sent: DemoParams | undefined;
   let raw: DemoMessage | undefined;
+  let upstreamFailed = false;
   const spy = {
     messages: {
       async create(params: DemoParams): Promise<DemoMessage> {
         sent = params;
-        raw = await create(params);
+        try {
+          raw = await create(params);
+        } catch (err) {
+          upstreamFailed = true;
+          throw err;
+        }
         return raw;
       },
     },
@@ -126,7 +136,7 @@ export async function runGate(note: string, policy: Policy, model: string, creat
     const name = err instanceof Error ? err.name : "UnknownError";
     return {
       ok: false,
-      error: { name, blockedCategories: err instanceof PiiBlockedError ? err.categories : undefined },
+      error: { name, blockedCategories: err instanceof PiiBlockedError ? err.categories : undefined, upstream: upstreamFailed },
       audit: records[0],
     };
   }

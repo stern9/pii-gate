@@ -76,11 +76,11 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
     reset();
   }
 
-  async function ask() {
+  async function ask(useMode: Mode = effectiveMode) {
     setRunning(true);
     reset();
     try {
-      if (effectiveMode === "simulated") {
+      if (useMode === "simulated") {
         setRun(await runGate(text, policy, "simulated", simulatedModel({ mangle })));
         return;
       }
@@ -93,10 +93,15 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
       if (res.ok) setRun(body as GateRun);
       else setRequestError((body as { message?: string }).message ?? `Request failed (${res.status}).`);
     } catch {
-      setRequestError("The request failed. Try the simulated model.");
+      setRequestError("Couldn't reach the demo server.");
     } finally {
       setRunning(false);
     }
+  }
+
+  function useSimulated() {
+    setMode("simulated");
+    void ask("simulated");
   }
 
   const detected = Object.entries(view.counts);
@@ -237,21 +242,15 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
               }
             />
           </div>
-          <Button className="self-start" size="lg" onClick={ask} disabled={running || text.trim() === ""}>
+          <Button className="self-start" size="lg" onClick={() => ask()} disabled={running || text.trim() === ""}>
             <Send aria-hidden /> {running ? "Asking…" : "Ask the model"}
           </Button>
         </CardContent>
       </Card>
 
-      {requestError && (
-        <Alert variant="destructive">
-          <TriangleAlert aria-hidden />
-          <AlertTitle>Request failed</AlertTitle>
-          <AlertDescription>{requestError}</AlertDescription>
-        </Alert>
-      )}
+      {requestError && <LiveUnavailable reason={requestError} onSimulate={useSimulated} />}
 
-      {run && <Results run={run} />}
+      {run && <Results run={run} onSimulate={useSimulated} />}
     </main>
   );
 }
@@ -344,7 +343,33 @@ function ActionPicker({
   );
 }
 
-function Results({ run }: { run: GateRun }) {
+function LiveUnavailable({ reason, onSimulate }: { reason: string; onSimulate: () => void }) {
+  return (
+    <Alert>
+      <TriangleAlert aria-hidden />
+      <AlertTitle>Live Claude didn&apos;t answer</AlertTitle>
+      <AlertDescription className="flex flex-col items-start gap-3">
+        <p>{reason}</p>
+        <Button size="sm" variant="outline" onClick={onSimulate}>
+          Run it with the simulated model instead
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+function Results({ run, onSimulate }: { run: GateRun; onSimulate: () => void }) {
+  if (!run.ok && run.error.upstream) {
+    return (
+      <section className="flex flex-col gap-4">
+        <LiveUnavailable
+          reason="Claude couldn't be reached. The note was masked before it was sent, so no personal details left the server."
+          onSimulate={onSimulate}
+        />
+        {run.audit && <Audit audit={run.audit} />}
+      </section>
+    );
+  }
   if (!run.ok) {
     return (
       <section className="flex flex-col gap-4">
@@ -421,12 +446,23 @@ function Blocks({ blocks }: { blocks: readonly Block[] }) {
         b.type === "text" ? (
           <TokenText key={i} text={String(b.text ?? "")} />
         ) : (
-          <div key={i} className="rounded-lg border bg-muted/30 p-3">
-            <div className="mb-1 text-xs font-medium text-muted-foreground">Tool call: {String(b.name)}</div>
-            <TokenText text={JSON.stringify(b.input, null, 2)} className="text-xs leading-6" />
-          </div>
+          <ToolCall key={i} block={b} />
         ),
       )}
+    </div>
+  );
+}
+
+function ToolCall({ block }: { block: Block }) {
+  const input = (block.input ?? {}) as Record<string, unknown>;
+  const { summary, ...rest } = input;
+  return (
+    <div className="flex flex-col gap-3">
+      {typeof summary === "string" && <TokenText text={summary} />}
+      <div className="rounded-lg border bg-muted/30 p-3">
+        <div className="mb-1 text-xs font-medium text-muted-foreground">Tool call: {String(block.name)}</div>
+        <TokenText text={JSON.stringify(typeof summary === "string" ? rest : input, null, 2)} className="text-xs leading-6" />
+      </div>
     </div>
   );
 }
