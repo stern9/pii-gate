@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "How a request flows through pii-gate",
+    "locale": "en",
+    "output": "docs/diagrams/request-flow.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/stern9/pii-gate",
+      "provider": "github",
+      "revision": "c2fd980e2b0af660f1d0c84fa6561e1d9fc57105"
+    }
+  },
+  "participants": [
+    {
+      "id": "app",
+      "type": "frontend",
+      "label": "Your app",
+      "sublabel": "messages.create"
+    },
+    {
+      "id": "gate",
+      "type": "security",
+      "label": "pii-gate",
+      "sublabel": "wrapAnthropic",
+      "sources": [
+        {
+          "path": "src/anthropic.ts",
+          "line": 224,
+          "label": "createWithReport"
+        },
+        {
+          "path": "src/mask.ts",
+          "line": 237,
+          "label": "maskAll"
+        },
+        {
+          "path": "src/unmask.ts",
+          "line": 81,
+          "label": "unmask"
+        }
+      ]
+    },
+    {
+      "id": "vault",
+      "type": "database",
+      "label": "Vault",
+      "sublabel": "one per request",
+      "sources": [
+        {
+          "path": "src/vault.ts",
+          "line": 42,
+          "label": "InMemoryVault"
+        }
+      ]
+    },
+    {
+      "id": "model",
+      "type": "cloud",
+      "label": "LLM API",
+      "sublabel": "sees placeholders only"
+    },
+    {
+      "id": "audit",
+      "type": "database",
+      "label": "Audit log",
+      "sublabel": "counts, never values",
+      "sources": [
+        {
+          "path": "src/audit.ts",
+          "line": 8,
+          "label": "AuditRecord"
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 255,
+      "to": 370,
+      "label": "Blocked category found"
+    },
+    {
+      "from": 375,
+      "to": 580,
+      "label": "Otherwise: mask and call"
+    },
+    {
+      "from": 585,
+      "to": 705,
+      "label": "Audit and reply"
+    }
+  ],
+  "messages": [
+    {
+      "id": "create",
+      "from": "app",
+      "to": "gate",
+      "y": 175,
+      "label": "messages.create(params)",
+      "variant": "emphasis",
+      "note": "Detects PII in system, messages and tool results"
+    },
+    {
+      "id": "audit-blocked",
+      "from": "gate",
+      "to": "audit",
+      "y": 270,
+      "label": "blocked: true, counts",
+      "variant": "security",
+      "note": "Before any placeholder is issued"
+    },
+    {
+      "id": "throw-blocked",
+      "from": "gate",
+      "to": "app",
+      "y": 325,
+      "label": "throw PiiBlockedError",
+      "variant": "return",
+      "note": "Nothing reaches the model"
+    },
+    {
+      "id": "vault-set",
+      "from": "gate",
+      "to": "vault",
+      "y": 390,
+      "label": "set(value) → {{PERSON_1}}",
+      "variant": "default",
+      "note": "Same value, same placeholder"
+    },
+    {
+      "id": "masked-call",
+      "from": "gate",
+      "to": "model",
+      "y": 445,
+      "label": "masked params",
+      "variant": "emphasis",
+      "note": "No original values cross this line"
+    },
+    {
+      "id": "model-reply",
+      "from": "model",
+      "to": "gate",
+      "y": 500,
+      "label": "reply with {{PERSON_1}}",
+      "variant": "return"
+    },
+    {
+      "id": "vault-get",
+      "from": "gate",
+      "to": "vault",
+      "y": 530,
+      "label": "get({{PERSON_1}}) → value",
+      "variant": "default",
+      "note": "Exact matches only; damaged tokens become warnings"
+    },
+    {
+      "id": "audit-ok",
+      "from": "gate",
+      "to": "audit",
+      "y": 600,
+      "label": "counts, placeholders, latency",
+      "variant": "security",
+      "note": "One record per request, never values"
+    },
+    {
+      "id": "restored-reply",
+      "from": "gate",
+      "to": "app",
+      "y": 655,
+      "label": "reply with real values",
+      "variant": "return",
+      "note": "Text and tool_use inputs restored"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "gate",
+      "from": 175,
+      "to": 655,
+      "type": "security"
+    },
+    {
+      "participant": "audit",
+      "from": 265,
+      "to": 276,
+      "type": "database"
+    },
+    {
+      "participant": "vault",
+      "from": 385,
+      "to": 396,
+      "type": "database"
+    },
+    {
+      "participant": "model",
+      "from": 445,
+      "to": 500,
+      "type": "cloud"
+    },
+    {
+      "participant": "vault",
+      "from": 525,
+      "to": 536,
+      "type": "database"
+    },
+    {
+      "participant": "audit",
+      "from": 595,
+      "to": 606,
+      "type": "database"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Block fails loud",
+      "items": [
+        "A blocked category stops the whole request before the model is called",
+        "The error and the audit row name the category, never the value"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Never guess",
+      "items": [
+        "Only exact placeholders are restored",
+        "A damaged placeholder stays as written and comes back as a warning"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "One vault per request",
+      "items": [
+        "Placeholders are stable within a request, so the model can tell who is who",
+        "The vault hides its values from console.log and JSON"
+      ]
+    }
+  ]
+}

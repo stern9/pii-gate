@@ -51,30 +51,12 @@ In the browser or an edge runtime, import from `pii-gate/core`. It has everythin
 
 ## How it works
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App
-    participant Gate as pii-gate
-    participant Vault as Vault (per request)
-    participant Model as LLM API
-    participant Audit as Audit log
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/request-flow-dark.png">
+  <img alt="Sequence diagram: your app calls pii-gate, which detects PII. If a blocked category is found it writes blocked: true to the audit log and throws PiiBlockedError, so nothing reaches the model. Otherwise it stores each value in the per-request vault as a placeholder like {{PERSON_1}}, sends the masked params to the LLM API, restores exact placeholders from the vault in the reply, writes counts and latency to the audit log, and returns the reply with real values." src="docs/diagrams/request-flow-light.png">
+</picture>
 
-    App->>Gate: messages.create(params)
-    Gate->>Gate: detect PII in system, messages, tool_results
-    alt category with policy "block" found
-        Gate->>Audit: {blocked: true, categoryCounts}
-        Gate-->>App: throw PiiBlockedError
-    else
-        Gate->>Vault: set(value, category) → {{CATEGORY_n}}
-        Gate->>Model: masked params
-        Model-->>Gate: response with placeholders
-        Gate->>Vault: get({{CATEGORY_n}}) → value
-        Gate->>Gate: unmask text + tool_use inputs (exact matches only)
-        Gate->>Audit: {categoryCounts, responseReferencedTokens, latencyMs}
-        Gate-->>App: response with original values
-    end
-```
+An [interactive version](demo/public/diagrams/request-flow.html) links each participant to its source. It is served from the demo site at `/diagrams/request-flow.html`. The diagram is generated with [Archify](https://github.com/tt-a1i/archify) from [`docs/diagrams/request-flow.archify.json`](docs/diagrams/request-flow.archify.json). Archify is MIT-licensed; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 - **Detection** comes from regex detectors for SSN, phone, email, VIN (with check digit), credit card (Luhn), DOB (cue-gated), driver's license (cue-gated), street address and person name (cue-gated). US formats are detected anywhere in the text. International phone numbers (`Phone: +44 20 7946 0958`, `phone number: 55501234`) and day-first dates of birth (`DOB: 15/02/1988`) are detected only directly after a label. When matches overlap, the longest wins, and ties go to the higher confidence. Numbers labelled as policy, claim or account identifiers are not reported as phones or SSNs.
 - **Schema hints** handle values you already know from the database record, which are masked directly without detection: `schemaHints: { insured: { value: row.insured_name, category: "PERSON" } }`. They take priority over detector output, and their categories can be custom (`CLAIM_ID`, `MEMBER_ID`).

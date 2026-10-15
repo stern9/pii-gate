@@ -3,3 +3,4 @@ dist
 *.jsonl
 .env*
 !.env.example
+.DS_Store

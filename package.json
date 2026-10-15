@@ -23,7 +23,7 @@
   "files": [
     "dist",
     "README.md",
-    "docs"
+    "docs/adr"
   ],
   "sideEffects": false,
   "scripts": {
