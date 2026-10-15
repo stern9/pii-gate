@@ -2,7 +2,7 @@ import { defaultDetectors, resolveOverlaps } from "./detectors/index.js";
 import { PiiBlockedError } from "./errors.js";
 import { assertValidCategory } from "./types.js";
 import type { Category, Detector, Finding, Policy, PolicyAction } from "./types.js";
-import { InMemoryVault, type Vault } from "./vault.js";
+import { InMemoryVault, normalizeValue, type Vault } from "./vault.js";
 
 /** A known value from a structured record, masked without relying on detection. */
 export interface SchemaHint {
@@ -104,8 +104,18 @@ function overlapsAny(f: Finding, others: readonly Finding[]): boolean {
 /** A value already identified somewhere in the request, to be masked wherever else it appears. */
 export type Seed = Pick<Finding, "value" | "category" | "confidence">;
 
-/** A seed after name-part expansion; parts match only as written, so "May" does not mask "may". */
-type ExpandedSeed = Seed & { exactCase?: boolean };
+/**
+ * A seed after name-part expansion; parts match only as written, so "May" does not mask "may".
+ * `canonical` is the full name a part belongs to, when exactly one detected name has that part.
+ */
+type ExpandedSeed = Seed & { exactCase?: boolean; canonical?: string };
+
+/**
+ * Full name a propagated name-part finding stands for, so `applyFindings` gives "Whitfield" the
+ * token of "Dana Whitfield" instead of a second PERSON token. Kept off the finding object itself
+ * so the extra value never shows up in `MaskFinding`s, logs, or serialized findings.
+ */
+const canonicalValues = new WeakMap<Finding, string>();
 
 /**
  * Finds further verbatim occurrences of `seeds` in `text` that do not
@@ -127,7 +137,11 @@ export function propagateFindings(
     if (seen.has(key) || seed.value.trim().length < MIN_PROPAGATION_LENGTH) continue;
     seen.add(key);
     const hits = findOccurrences(text, seed.value, seed.category, seed.confidence, "propagation", seed.exactCase);
-    extra.push(...hits.filter((h) => !overlapsAny(h, existing) && !overlapsAny(h, extra)));
+    for (const hit of hits) {
+      if (overlapsAny(hit, existing) || overlapsAny(hit, extra)) continue;
+      if (seed.canonical !== undefined) canonicalValues.set(hit, seed.canonical);
+      extra.push(hit);
+    }
   }
   return extra;
 }
@@ -137,6 +151,9 @@ const NAME_PART = /^\p{Lu}[\p{L}'’-]{2,}$/u;
 /**
  * Full values first (so they win over parts), then the individual name parts at lower
  * confidence. Parts are case-sensitive: a part like "May" or "Bill" is also an ordinary word.
+ * A part shared by exactly one distinct full name carries it as `canonical` (same token as the
+ * full name); a part shared by two different names ("Dana Whitfield", "Sam Whitfield") is
+ * ambiguous and gets no canonical, so it is masked under a token of its own.
  */
 function withNameParts(seeds: readonly Seed[]): ExpandedSeed[] {
   const parts = seeds
@@ -145,9 +162,19 @@ function withNameParts(seeds: readonly Seed[]): ExpandedSeed[] {
       s.value
         .split(/\s+/)
         .filter((p) => NAME_PART.test(p))
-        .map((value) => ({ value, category: s.category, confidence: s.confidence * 0.8, exactCase: true })),
+        .map((value) => ({ value, category: s.category, confidence: s.confidence * 0.8, full: s.value })),
     );
-  return [...seeds].sort((a, b) => b.value.length - a.value.length).concat(parts);
+  const owners = new Map<string, Set<string>>();
+  for (const p of parts) {
+    const set = owners.get(p.value) ?? new Set<string>();
+    set.add(normalizeValue(p.full));
+    owners.set(p.value, set);
+  }
+  const expanded = parts.map(({ full, ...p }): ExpandedSeed => {
+    const unambiguous = owners.get(p.value)?.size === 1;
+    return unambiguous ? { ...p, exactCase: true, canonical: full } : { ...p, exactCase: true };
+  });
+  return [...seeds].sort((a, b) => b.value.length - a.value.length).concat(expanded);
 }
 
 /**
@@ -198,7 +225,7 @@ export function applyFindings(text: string, findings: readonly Finding[], vault:
       results.push({ ...f, action });
       continue;
     }
-    const token = vault.set(f.value, f.category);
+    const token = vault.set(canonicalValues.get(f) ?? f.value, f.category);
     out.push(text.slice(cursor, f.start), token);
     cursor = f.end;
     results.push({ ...f, action, token });

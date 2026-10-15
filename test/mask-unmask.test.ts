@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryVault, hydrate, mask, maskAll, unmask, unmaskDeep, type JsonValue } from "../src/index.js";
+import {
+  InMemoryVault,
+  PiiBlockedError,
+  hydrate,
+  mask,
+  maskAll,
+  unmask,
+  unmaskDeep,
+  type JsonValue,
+} from "../src/index.js";
+import { countByCategory } from "../src/mask.js";
 import { loadFixtures } from "./helpers.js";
 
 const NOTE =
@@ -30,26 +40,86 @@ describe("mask", () => {
 
   it("propagates name parts case-sensitively, leaving ordinary lowercase words alone", () => {
     expect(mask("Claimant: Sarah May. Adjuster may call back. May confirmed.").masked).toBe(
-      "Claimant: {{PERSON_1}}. Adjuster may call back. {{PERSON_2}} confirmed.",
+      "Claimant: {{PERSON_1}}. Adjuster may call back. {{PERSON_1}} confirmed.",
     );
     expect(mask("Insured: Robert Bill Chen. Please bill the account. Bill called.").masked).toBe(
-      "Insured: {{PERSON_1}}. Please bill the account. {{PERSON_2}} called.",
+      "Insured: {{PERSON_1}}. Please bill the account. {{PERSON_1}} called.",
     );
     expect(maskAll(["Insured: Robert Bill Chen", "Please bill Bill."]).masked).toEqual([
-      "Insured: {{PERSON_1}}", "Please bill {{PERSON_2}}.",
+      "Insured: {{PERSON_1}}", "Please bill {{PERSON_1}}.",
     ]);
   });
 
   it("still masks a capitalized sentence-initial word that matches a name part (documented over-mask)", () => {
     expect(mask("Claimant: Sarah May. May I ask why the adjuster may be late?").masked).toBe(
-      "Claimant: {{PERSON_1}}. {{PERSON_2}} I ask why the adjuster may be late?",
+      "Claimant: {{PERSON_1}}. {{PERSON_1}} I ask why the adjuster may be late?",
     );
   });
 
   it("propagates accented name parts only in their written case", () => {
     expect(mask("Claimant: Zoë Ángeles. Ángeles signed; the los ángeles office was notified.").masked).toBe(
-      "Claimant: {{PERSON_1}}. {{PERSON_2}} signed; the los ángeles office was notified.",
+      "Claimant: {{PERSON_1}}. {{PERSON_1}} signed; the los ángeles office was notified.",
     );
+  });
+
+  it("gives a propagated surname the full name's token, so the model sees one person", () => {
+    const note =
+      "Insured: Dana Whitfield, DOB: 04/22/1986.\nDana Whitfield says the other driver left. " +
+      "Whitfield asked that updates go to dana.whitfield@example.com.";
+    const { masked, vault, findings } = mask(note);
+    expect(masked).toBe(
+      "Insured: {{PERSON_1}}, DOB: {{DOB_1}}.\n{{PERSON_1}} says the other driver left. " +
+        "{{PERSON_1}} asked that updates go to {{EMAIL_1}}.",
+    );
+    const people = findings.filter((f) => f.category === "PERSON");
+    expect(people).toHaveLength(3);
+    expect(new Set(people.map((f) => f.token))).toEqual(new Set(["{{PERSON_1}}"]));
+    expect(vault.entries().filter((e) => e.category === "PERSON")).toHaveLength(1);
+    const part = people[2];
+    expect(part && note.slice(part.start, part.end)).toBe("Whitfield");
+    expect(part?.value).toBe("Whitfield");
+    expect(Object.keys(part ?? {}).sort()).toEqual(
+      ["action", "category", "confidence", "detector", "end", "start", "token", "value"],
+    );
+    expect(unmask("Confirm how {{PERSON_1}} relates to the insured.", vault).text).toBe(
+      "Confirm how Dana Whitfield relates to the insured.",
+    );
+  });
+
+  it("maps a possessive surname to the claimant's token", () => {
+    const { masked, findings } = mask("Claimant: Tomasz Kowalski. Kowalski prefers email; Kowalski's car is towed.");
+    expect(masked).toBe("Claimant: {{PERSON_1}}. {{PERSON_1}} prefers email; {{PERSON_1}}'s car is towed.");
+    expect(countByCategory(findings)).toEqual({ PERSON: 3 });
+  });
+
+  it("maps a surname in one text to a full name cued in another (maskAll)", () => {
+    const { masked, vault } = maskAll([
+      "System: the insured is Claimant: Dana Whitfield.",
+      "CRM lookup: Whitfield, policy active.",
+    ]);
+    expect(masked).toEqual(["System: the insured is Claimant: {{PERSON_1}}.", "CRM lookup: {{PERSON_1}}, policy active."]);
+    expect(vault.size).toBe(1);
+    expect(vault.get("{{PERSON_1}}")).toBe("Dana Whitfield");
+  });
+
+  it("maps a surname to a full name already in a reused vault", () => {
+    const vault = new InMemoryVault();
+    mask("Claimant: Tomasz Kowalski called.", { vault });
+    const { masked } = maskAll(["Kowalski called back."], { vault });
+    expect(masked).toEqual(["{{PERSON_1}} called back."]);
+    expect(vault.size).toBe(1);
+  });
+
+  it("does not guess when two detected names share a part: the bare part gets its own token", () => {
+    const { masked, vault } = mask("Insured: Dana Whitfield. Driver: Sam Whitfield. Whitfield called.");
+    expect(masked).toBe("Insured: {{PERSON_1}}. Driver: {{PERSON_2}}. {{PERSON_3}} called.");
+    expect(vault.get("{{PERSON_3}}")).toBe("Whitfield");
+  });
+
+  it("applies the PERSON policy to propagated parts", () => {
+    const text = "Claimant: Tomasz Kowalski. Kowalski called.";
+    expect(mask(text, { policy: { PERSON: "allow" } }).masked).toBe(text);
+    expect(() => mask(text, { policy: { PERSON: "block" } })).toThrow(PiiBlockedError);
   });
 
   it("keeps full-name propagation case-insensitive and whitespace-tolerant", () => {
@@ -99,11 +169,21 @@ describe("mask", () => {
 });
 
 describe("unmask round trip", () => {
-  it.each(loadFixtures())("restores $file exactly", (fx) => {
-    const { masked, vault } = mask(fx.text);
+  // Name-part propagation maps a bare surname to the full name's token, so unmasking restores the
+  // full name there ("Kowalski's" -> "Tomasz Kowalski's"). The exact round trip is checked without parts;
+  // with defaults, the restored text must re-mask to the same masked text.
+  it.each(loadFixtures())("restores $file exactly (without name parts)", (fx) => {
+    const { masked, vault } = mask(fx.text, { propagateNameParts: false });
     const { text, warnings } = unmask(masked, vault);
     expect(text).toBe(fx.text);
     expect(warnings).toEqual([]);
+  });
+
+  it.each(loadFixtures())("restores $file to text that re-masks identically", (fx) => {
+    const { masked, vault } = mask(fx.text);
+    const { text, warnings } = unmask(masked, vault);
+    expect(warnings).toEqual([]);
+    expect(mask(text).masked).toBe(masked);
   });
 
   it("restores a model-style response that references tokens", () => {

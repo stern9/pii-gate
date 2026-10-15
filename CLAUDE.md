@@ -30,6 +30,7 @@ Flow: app → `mask()` (detect → typed placeholders like `{{PERSON_1}}`, origi
 - Uncued, lowercase names are not detected (needs NER).
 - Address detector masks the street line only.
 - Name propagation can over-mask a surname that is also a street name (`propagateNameParts: false` turns it off).
+- A propagated name part reuses the full name's token, so unmask restores the full name where only the part appeared. A part shared by two detected names is ambiguous and gets its own token (no guessing).
 - US formats are detected anywhere; international phones and day-first DOBs only directly after a label (unlabelled non-US formats pass through).
 
 ## Roadmap ideas
