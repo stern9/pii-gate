@@ -1,0 +1,11 @@
+{
+  "name": "Travel claim with a UK contact",
+  "description": "Labelled international phones and a day-first labelled DOB are masked; an uncued day-first loss date, a claim number on the line after a phone label, and a policy number stay.",
+  "text": "TRAVEL CLAIM — Claim # CLM-90233. Policy No. 512-555-0147.\nClaimant: Oliver Pemberton, DOB: 15/02/1988. Date of loss 09/06/2024 (London).\nPhone: +44 20 7946 0321. Mobile: 07700 900461.\nAlternate phone:\nClaim # 55501234 (prior claim, closed).\nCorrespondence to oliver.pemberton@example.co.uk.",
+  "expected": {
+    "PERSON": ["Oliver Pemberton"],
+    "DOB": ["15/02/1988"],
+    "PHONE": ["+44 20 7946 0321", "07700 900461"],
+    "EMAIL": ["oliver.pemberton@example.co.uk"]
+  }
+}

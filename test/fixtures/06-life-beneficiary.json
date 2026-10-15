@@ -1,0 +1,9 @@
+{
+  "name": "Life policy beneficiary change",
+  "text": "Beneficiary change request received.\nInsured: Harold J. McAllister (born 1948-11-02)\nBeneficiary: Susan McAllister-Reyes\nWitness: Dr. Alan Pierce\nSSN on file 219099999 to be verified by phone.\nPlease route to underwriting; no address change.",
+  "expected": {
+    "PERSON": ["Harold J. McAllister", "Susan McAllister-Reyes", "Alan Pierce"],
+    "DOB": ["1948-11-02"],
+    "SSN": ["219099999"]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "Auto claim adjuster note",
+  "text": "CLAIM NOTE 2024-06-11 — Claim # CLM-88412\nInsured: Maria Gonzalez, DOB: 03/14/1979. Policy No. 512-555-0147 (personal auto).\nInsured called from (512) 555-0198 to report rear-end collision on I-35. Date of loss 06/09/2024.\nVehicle: 2003 Honda Accord, VIN 1HGCM82633A004352. Driver's license # TX12345678.\nMaria Gonzalez states the other driver left the scene. Follow-up email sent to maria.gonzalez@example.com.",
+  "expected": {
+    "PERSON": ["Maria Gonzalez", "Maria Gonzalez"],
+    "DOB": ["03/14/1979"],
+    "PHONE": ["(512) 555-0198"],
+    "VIN": ["1HGCM82633A004352"],
+    "DRIVERS_LICENSE": ["TX12345678"],
+    "EMAIL": ["maria.gonzalez@example.com"]
+  }
+}

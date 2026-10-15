@@ -1,0 +1,13 @@
+{
+  "name": "Client record export (key: value)",
+  "text": "Policyholder: Daniel K. Whitfield\nSSN: 123-45-6789\nDate of birth: July 4, 1985\nEmail: dwhitfield@example.org\nPhone: 210-555-0177\nMailing address: 1290 Elm Street, San Antonio, TX 78209\nPayment method: Visa ending 1111 (card 4111-1111-1111-1111)\nAgent of record: Goose Valley Agency",
+  "expected": {
+    "PERSON": ["Daniel K. Whitfield"],
+    "SSN": ["123-45-6789"],
+    "DOB": ["July 4, 1985"],
+    "EMAIL": ["dwhitfield@example.org"],
+    "PHONE": ["210-555-0177"],
+    "ADDRESS": ["1290 Elm Street, San Antonio, TX 78209"],
+    "CREDIT_CARD": ["4111-1111-1111-1111"]
+  }
+}

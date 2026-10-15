@@ -1,0 +1,23 @@
+{
+  "name": "Workers' comp intake with split name and amex",
+  "text": "FNOL intake — workers' comp.\nClaimant: Tomasz\nKowalski, warehouse associate, injured lifting pallet 05/02/2024.\nEmployer contact: Mr. Greg Odum, +1 (972) 555-0161 ext 204.\nClaimant prefers contact by email: t.kowalski@example.net. Employer card for copay: 3782 822463 10005.\nKowalski's home: 77 W 3rd St, Dallas, TX.",
+  "expected": {
+    "PERSON": [
+      "Tomasz\nKowalski",
+      "Greg Odum",
+      "Kowalski"
+    ],
+    "PHONE": [
+      "+1 (972) 555-0161 ext 204"
+    ],
+    "EMAIL": [
+      "t.kowalski@example.net"
+    ],
+    "CREDIT_CARD": [
+      "3782 822463 10005"
+    ],
+    "ADDRESS": [
+      "77 W 3rd St, Dallas, TX"
+    ]
+  }
+}

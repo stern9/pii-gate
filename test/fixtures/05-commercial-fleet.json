@@ -1,0 +1,11 @@
+{
+  "name": "Commercial fleet schedule change",
+  "text": "Fleet schedule update for Lone Star Logistics LLC.\nAdd unit: 2016 Ford Fusion, VIN 3FADP4BJ1EM100001, assigned driver: Luis Ortega (DL# 09876543).\nRemove unit: VIN 5NPE24AF6FH000123.\nContact: Angela Brooks, fleet manager, angela.brooks@lonestar-logistics.example, cell 469.555.0142.",
+  "expected": {
+    "VIN": ["3FADP4BJ1EM100001", "5NPE24AF6FH000123"],
+    "PERSON": ["Luis Ortega", "Angela Brooks"],
+    "DRIVERS_LICENSE": ["09876543"],
+    "EMAIL": ["angela.brooks@lonestar-logistics.example"],
+    "PHONE": ["469.555.0142"]
+  }
+}

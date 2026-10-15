@@ -1,0 +1,251 @@
+import { defaultDetectors, resolveOverlaps } from "./detectors/index.js";
+import { PiiBlockedError } from "./errors.js";
+import { assertValidCategory } from "./types.js";
+import type { Category, Detector, Finding, Policy, PolicyAction } from "./types.js";
+import { InMemoryVault, type Vault } from "./vault.js";
+
+/** A known value from a structured record, masked without relying on detection. */
+export interface SchemaHint {
+  value: string | null | undefined;
+  category: Category;
+}
+
+/**
+ * Keyed by field name for readability at the call site, e.g.
+ * `{ insuredName: { value: row.insured_name, category: "PERSON" } }`.
+ * Empty and very short values (< 2 chars) are ignored.
+ */
+export type SchemaHints = Record<string, SchemaHint>;
+
+export interface MaskOptions {
+  /** Per-category action. Categories not listed use `defaultAction`. */
+  policy?: Policy;
+  /** Default "mask". */
+  defaultAction?: PolicyAction;
+  /** Default: all built-in detectors. Pass `[...defaultDetectors(), myNer]` to extend. */
+  detectors?: readonly Detector[];
+  schemaHints?: SchemaHints;
+  /** Reuse a vault to share token numbering across several texts in one request. */
+  vault?: Vault;
+  /** Default 0.5. */
+  minConfidence?: number;
+  /**
+   * Default true. Once a value is detected (usually via a cue like
+   * "Insured:"), mask its other verbatim occurrences too.
+   */
+  propagate?: boolean;
+  /**
+   * Default true. Also propagate each part (>= 3 letters) of a detected
+   * PERSON name, so "Kowalski's" is masked after "Claimant: Tomasz Kowalski".
+   * Over-masks shared words (a surname that is also a street name).
+   */
+  propagateNameParts?: boolean;
+}
+
+export interface MaskFinding extends Finding {
+  action: PolicyAction;
+  /** Placeholder that replaced the value; absent when the action was "allow". */
+  token?: string;
+}
+
+export interface MaskResult {
+  masked: string;
+  vault: Vault;
+  findings: MaskFinding[];
+}
+
+const HINT_CONFIDENCE = 1;
+const MIN_HINT_LENGTH = 2;
+const MIN_PROPAGATION_LENGTH = 3;
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Matches `value` with any whitespace run allowed where the value has whitespace, on word boundaries.
+ * Case-insensitive unless `exactCase`.
+ */
+function occurrencePattern(value: string, exactCase = false): RegExp {
+  const body = value.trim().split(/\s+/).map(escapeRegex).join("\\s+");
+  return new RegExp(`(?<![\\p{L}\\p{N}_])${body}(?![\\p{L}\\p{N}_])`, exactCase ? "gu" : "giu");
+}
+
+function findOccurrences(
+  text: string,
+  value: string,
+  category: Category,
+  confidence: number,
+  detector: string,
+  exactCase = false,
+): Finding[] {
+  const findings: Finding[] = [];
+  for (const m of text.matchAll(occurrencePattern(value, exactCase))) {
+    const start = m.index;
+    findings.push({ category, start, end: start + m[0].length, value: m[0], confidence, detector });
+  }
+  return findings;
+}
+
+function hintFindings(text: string, hints: SchemaHints | undefined): Finding[] {
+  if (!hints) return [];
+  return Object.entries(hints).flatMap(([field, hint]) => {
+    const value = hint.value?.trim();
+    if (!value || value.length < MIN_HINT_LENGTH) return [];
+    assertValidCategory(hint.category);
+    return findOccurrences(text, value, hint.category, HINT_CONFIDENCE, `schema:${field}`);
+  });
+}
+
+function overlapsAny(f: Finding, others: readonly Finding[]): boolean {
+  return others.some((o) => f.start < o.end && o.start < f.end);
+}
+
+/** A value already identified somewhere in the request, to be masked wherever else it appears. */
+export type Seed = Pick<Finding, "value" | "category" | "confidence">;
+
+/** A seed after name-part expansion; parts match only as written, so "May" does not mask "may". */
+type ExpandedSeed = Seed & { exactCase?: boolean };
+
+/**
+ * Finds further verbatim occurrences of `seeds` in `text` that do not
+ * overlap `existing`. This is what catches "spoke with Maria Gonzalez" after
+ * "Claimant: Maria Gonzalez" was detected via its cue.
+ */
+export function propagateFindings(
+  text: string,
+  seeds: readonly Seed[],
+  existing: readonly Finding[],
+  options: Pick<MaskOptions, "propagateNameParts"> = {},
+): Finding[] {
+  const expanded: readonly ExpandedSeed[] = options.propagateNameParts === false ? seeds : withNameParts(seeds);
+  const seen = new Set<string>();
+  const extra: Finding[] = [];
+  for (const seed of expanded) {
+    const spelled = seed.value.replace(/\s+/g, " ");
+    const key = `${seed.category}\u0000${seed.exactCase ? spelled : spelled.toLowerCase()}`;
+    if (seen.has(key) || seed.value.trim().length < MIN_PROPAGATION_LENGTH) continue;
+    seen.add(key);
+    const hits = findOccurrences(text, seed.value, seed.category, seed.confidence, "propagation", seed.exactCase);
+    extra.push(...hits.filter((h) => !overlapsAny(h, existing) && !overlapsAny(h, extra)));
+  }
+  return extra;
+}
+
+const NAME_PART = /^\p{Lu}[\p{L}'’-]{2,}$/u;
+
+/**
+ * Full values first (so they win over parts), then the individual name parts at lower
+ * confidence. Parts are case-sensitive: a part like "May" or "Bill" is also an ordinary word.
+ */
+function withNameParts(seeds: readonly Seed[]): ExpandedSeed[] {
+  const parts = seeds
+    .filter((s) => s.category === "PERSON")
+    .flatMap((s) =>
+      s.value
+        .split(/\s+/)
+        .filter((p) => NAME_PART.test(p))
+        .map((value) => ({ value, category: s.category, confidence: s.confidence * 0.8, exactCase: true })),
+    );
+  return [...seeds].sort((a, b) => b.value.length - a.value.length).concat(parts);
+}
+
+/**
+ * Schema hints plus detector output for one text, without propagation.
+ * Hints are trusted over detectors, so detector findings that collide with
+ * a hint are dropped.
+ */
+export function detectFindings(text: string, options: MaskOptions = {}): Finding[] {
+  const hints = resolveOverlaps(hintFindings(text, options.schemaHints));
+  const minConfidence = options.minConfidence ?? 0.5;
+  const detected = (options.detectors ?? defaultDetectors())
+    .flatMap((d) => d.detect(text))
+    .filter((f) => f.confidence >= minConfidence && !overlapsAny(f, hints));
+  for (const f of detected) assertValidCategory(f.category);
+  return [...hints, ...resolveOverlaps(detected)].sort((a, b) => a.start - b.start);
+}
+
+/** Final, non-overlapping findings for a single text, sorted by position. */
+export function collectFindings(text: string, options: MaskOptions = {}): Finding[] {
+  const base = detectFindings(text, options);
+  if (options.propagate === false) return base;
+  return [...base, ...propagateFindings(text, base, base, options)].sort((a, b) => a.start - b.start);
+}
+
+export function actionFor(category: Category, options: Pick<MaskOptions, "policy" | "defaultAction">): PolicyAction {
+  return options.policy?.[category] ?? options.defaultAction ?? "mask";
+}
+
+export function countByCategory(findings: readonly Pick<Finding, "category">[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const f of findings) counts[f.category] = (counts[f.category] ?? 0) + 1;
+  return counts;
+}
+
+export function assertNotBlocked(findings: readonly Finding[], options: MaskOptions): void {
+  const blocked = findings.filter((f) => actionFor(f.category, options) === "block");
+  if (blocked.length > 0) throw new PiiBlockedError(countByCategory(blocked));
+}
+
+/** Replaces precomputed, non-overlapping, position-sorted findings with vault tokens according to policy. */
+export function applyFindings(text: string, findings: readonly Finding[], vault: Vault, options: MaskOptions): MaskResult {
+  const out: string[] = [];
+  const results: MaskFinding[] = [];
+  let cursor = 0;
+  for (const f of findings) {
+    const action = actionFor(f.category, options);
+    if (action === "allow") {
+      results.push({ ...f, action });
+      continue;
+    }
+    const token = vault.set(f.value, f.category);
+    out.push(text.slice(cursor, f.start), token);
+    cursor = f.end;
+    results.push({ ...f, action, token });
+  }
+  out.push(text.slice(cursor));
+  return { masked: out.join(""), vault, findings: results };
+}
+
+/**
+ * Detects PII in `text` and replaces it with typed placeholders such as
+ * `{{PERSON_1}}`. Throws `PiiBlockedError` (before touching the vault) if
+ * any finding falls in a category whose policy is "block".
+ */
+export function mask(text: string, options: MaskOptions = {}): MaskResult {
+  const vault = options.vault ?? new InMemoryVault();
+  const findings = collectFindings(text, options);
+  assertNotBlocked(findings, options);
+  return applyFindings(text, findings, vault, options);
+}
+
+export interface MaskAllResult {
+  masked: string[];
+  vault: Vault;
+  findings: MaskFinding[][];
+}
+
+/**
+ * Masks several texts that belong to one request (system prompt, messages,
+ * tool results) with a single vault. Detection runs over every text before
+ * anything is replaced, so:
+ *  - a block anywhere aborts the whole request before any token is issued;
+ *  - a name found via a cue in one text is also masked where it appears
+ *    uncued in another;
+ *  - values already in a reused vault are masked wherever they reappear.
+ */
+export function maskAll(texts: readonly string[], options: MaskOptions = {}): MaskAllResult {
+  const vault = options.vault ?? new InMemoryVault();
+  const base = texts.map((t) => detectFindings(t, options));
+  const perText =
+    options.propagate === false
+      ? base
+      : base.map((own, i) => {
+          const seeds: Seed[] = [...base.flat(), ...vault.entries().map((e) => ({ ...e, confidence: 1 }))];
+          const extra = propagateFindings(texts[i] ?? "", seeds, own, options);
+          return [...own, ...extra].sort((a, b) => a.start - b.start);
+        });
+  assertNotBlocked(perText.flat(), options);
+  const results = texts.map((t, i) => applyFindings(t, perText[i] ?? [], vault, options));
+  return { masked: results.map((r) => r.masked), vault, findings: results.map((r) => r.findings) };
+}

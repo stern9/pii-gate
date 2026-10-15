@@ -1,0 +1,9 @@
+{
+  "name": "Homeowners renewal email",
+  "text": "Subject: Your homeowners policy renewal\n\nDear Ms. Priya Raman,\n\nYour HO-3 policy for the property at 4821 Oak Hollow Dr, Apt 3B, Austin, TX 78745 renews on 08/01/2024. The new annual premium is $2,184.00.\n\nIf you have questions, reply to this email or call our service team at 1-800-555-0110. We have your contact number on file as 737-555-0123.\n\nThanks,\nService Team",
+  "expected": {
+    "PERSON": ["Priya Raman"],
+    "ADDRESS": ["4821 Oak Hollow Dr, Apt 3B, Austin, TX 78745"],
+    "PHONE": ["1-800-555-0110", "737-555-0123"]
+  }
+}

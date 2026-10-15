@@ -1,0 +1,153 @@
+# pii-gate
+
+A small TypeScript library that sits between your application and an LLM API. It finds personal data in outgoing prompts, swaps it for typed placeholders (`{{PERSON_1}}`, `{{SSN_1}}`), sends the masked request, then puts the original values back into the model's reply and tool calls. Insurance work is full of exactly this data. Claims notes, policy emails and client records carry names, SSNs, VINs, dates of birth and addresses. Most useful LLM tasks on that text (summarising a loss, drafting a renewal letter, routing a FNOL) don't need the actual values. pii-gate lets you use a hosted model on that text while keeping the identifiers in your own process. It also writes an audit trail of what was masked, and it never records the values themselves.
+
+The core has zero runtime dependencies. The Anthropic wrapper is typed structurally, so `@anthropic-ai/sdk` is an optional peer.
+
+## Quickstart
+
+```bash
+npm install pii-gate
+```
+
+```ts
+import { mask, unmask } from "pii-gate";
+
+const { masked, vault } = mask(
+  "Insured: Maria Gonzalez, DOB: 03/14/1979. Called from (512) 555-0198.",
+);
+// "Insured: {{PERSON_1}}, DOB: {{DOB_1}}. Called from {{PHONE_1}}."
+
+const reply = await callYourModel(masked); // "Draft a callback to {{PERSON_1}} at {{PHONE_1}}."
+const { text, warnings } = unmask(reply, vault);
+// "Draft a callback to Maria Gonzalez at (512) 555-0198."
+```
+
+With the Anthropic SDK:
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import type { Message, MessageCreateParamsNonStreaming } from "@anthropic-ai/sdk/resources/messages";
+import { JsonlAuditLogger, wrapAnthropic } from "pii-gate";
+
+const client = wrapAnthropic<MessageCreateParamsNonStreaming, Message>(new Anthropic(), {
+  policy: { SSN: "block", CREDIT_CARD: "block" },
+  audit: new JsonlAuditLogger("./logs/pii-audit.jsonl"),
+});
+
+const message = await client.messages.create({
+  model: "claude-opus-5-5",
+  max_tokens: 1024,
+  messages: [{ role: "user", content: `Summarize this claim note:\n${note}` }],
+});
+// Text blocks and tool_use inputs come back with original values restored.
+```
+
+Run `npm run example` to see the whole flow against a fake client.
+
+In the browser or an edge runtime, import from `pii-gate/core`. It has everything above except the file-based `JsonlAuditLogger` and `MemoryAuditLogger`, and uses no Node built-ins.
+
+`demo/` is a Next.js page that runs a fictional claims note through the whole flow: detected values, the masked prompt, the model's reply, the restored reply and the audit row. See `demo/README.md`.
+
+## How it works
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App
+    participant Gate as pii-gate
+    participant Vault as Vault (per request)
+    participant Model as LLM API
+    participant Audit as Audit log
+
+    App->>Gate: messages.create(params)
+    Gate->>Gate: detect PII in system, messages, tool_results
+    alt category with policy "block" found
+        Gate->>Audit: {blocked: true, categoryCounts}
+        Gate-->>App: throw PiiBlockedError
+    else
+        Gate->>Vault: set(value, category) → {{CATEGORY_n}}
+        Gate->>Model: masked params
+        Model-->>Gate: response with placeholders
+        Gate->>Vault: get({{CATEGORY_n}}) → value
+        Gate->>Gate: unmask text + tool_use inputs (exact matches only)
+        Gate->>Audit: {categoryCounts, responseReferencedTokens, latencyMs}
+        Gate-->>App: response with original values
+    end
+```
+
+- **Detection** comes from regex detectors for SSN, phone, email, VIN (with check digit), credit card (Luhn), DOB (cue-gated), driver's license (cue-gated), street address and person name (cue-gated). US formats are detected anywhere in the text. International phone numbers (`Phone: +44 20 7946 0958`, `phone number: 55501234`) and day-first dates of birth (`DOB: 15/02/1988`) are detected only directly after a label. When matches overlap, the longest wins, and ties go to the higher confidence. Numbers labelled as policy, claim or account identifiers are not reported as phones or SSNs.
+- **Schema hints** handle values you already know from the database record, which are masked directly without detection: `schemaHints: { insured: { value: row.insured_name, category: "PERSON" } }`. They take priority over detector output, and their categories can be custom (`CLAIM_ID`, `MEMBER_ID`).
+- **Propagation** works like this: once a name is found through a cue ("Claimant: Tomasz Kowalski"), its other occurrences in the same request get masked too ("Kowalski's home", "tomasz kowalski"). The full name matches in any case; a single part ("Kowalski") matches only as written, so "Claimant: Sarah May" doesn't mask "the adjuster may call". The wrapper applies this across the system prompt, every message and every tool result.
+- **The vault** holds token ↔ value for one request. The same value always gets the same token, so the model can reason that two mentions refer to one person.
+- **Unmasking** is exact-match only. If the model mangles a token (`{person_1}}`, `[[SSN_1]]`, `SSN_1`), the text is left as written and a warning with a suggested token is returned. A wrong restore could put one customer's data into another customer's letter, so a visible placeholder is the safer failure.
+- **Audit records** hold the request id, timestamp, model, per-category counts, the blocked flag, the number of placeholders in the response, the unmask warning count and the latency. They never contain values, prompt text or upstream error messages.
+
+Every call through `wrapAnthropic` writes exactly one audit record, including calls rejected before they reach the model. A policy block is recorded as `blocked: true`, with the triggering categories in `blockedCategories`. Other rejections (a streaming request, unsupported content such as an image, an invalid category from a schema hint or custom detector) and upstream API failures are recorded with `error` set to the error's class name only, never its message, because messages can echo input. If the audit logger itself throws while a request is failing, the original error is rethrown and the audit failure is dropped, so `instanceof` checks on the caller's side still work. On a successful request, an audit failure is passed on to the caller.
+
+### Plugging in other detectors
+
+```ts
+import { defaultDetectors, mask, staticDetector, type Detector } from "pii-gate";
+
+const memberIds: Detector = {
+  name: "member-id",
+  categories: ["MEMBER_ID"],
+  detect: (text) => [...text.matchAll(/\bGH-\d{8}\b/g)].map((m) => ({
+    category: "MEMBER_ID", start: m.index, end: m.index + m[0].length, value: m[0], confidence: 0.9,
+  })),
+};
+
+// Async NER: run it first, then feed its spans in.
+const nerSpans = await myNer(text);
+mask(text, { detectors: [...defaultDetectors(), memberIds, staticDetector("ner", nerSpans)] });
+```
+
+## Policy model
+
+Each category gets one action. Categories you don't list use `defaultAction`, which defaults to `"mask"`.
+
+| Action  | Effect | Typical use |
+|---------|--------|-------------|
+| `mask`  | Replace with a placeholder and restore it in the response. | Names, phones, emails, addresses, VINs: the model needs to know *that* there is a person or vehicle, not *which* one. |
+| `block` | Throw `PiiBlockedError` before anything is sent or tokenised. The error lists categories and counts only. | SSNs, card numbers. No prompt needs them, and if one shows up it usually means a template or retrieval step is pulling the wrong field. |
+| `allow` | Leave the value in place. It is still detected and counted in the audit. | Values the task depends on, such as `DOB` for an age-rating question, or an agency's own phone number. |
+
+See [docs/adr/0001-mask-vs-block-vs-allow.md](docs/adr/0001-mask-vs-block-vs-allow.md) for why there are three actions rather than one.
+
+## Limitations
+
+- **Regex misses things.** The detectors are tuned for precision. A name with no cue ("spoke with Maria about the claim") is not detected unless it also appears with a cue, or you pass it as a schema hint. Non-US formats are covered only where a label makes them unambiguous: international phone numbers are detected only after a phone label (phone, tel, mobile, cell, contact number, ...), and day-first dates of birth only after a birth cue. An unlabelled international number or day-first date passes through. Other national IDs and non-NANP addresses are not covered. PO boxes, rural routes and addresses that wrap across lines are missed, and the address detector masks the street line only — city, state and ZIP pass through, which is usually acceptable but worth knowing.
+- **NER is still needed for free text.** Adjuster notes and emails mention people, employers, medical providers and places without labels. Plug a named-entity model in through the `Detector` interface (or `staticDetector` for async models) and use regex as a deterministic floor. Even then, nothing here guarantees zero leakage. Treat this as one layer next to data minimisation and vendor agreements.
+- **Quasi-identifiers pass through.** A loss description ("the only red Tesla on Elm in a town of 400") can identify someone with no PII in it. Detection doesn't address re-identification.
+- **No cross-request linkage.** Vaults are per request, so `{{PERSON_1}}` in one call and `{{PERSON_1}}` in the next can be different people. For a multi-turn conversation, either re-send the full history each time (the usual Messages API pattern, and what the wrapper expects) or pass a `createVault` that returns a conversation-scoped vault. In both cases the model never sees a stable identifier across conversations, which is deliberate.
+- **Name-part propagation is a heuristic.** Parts of a detected name are masked wherever they appear capitalized, so a surname that is also a street name, or "May"/"Bill" at the start of a sentence, gets over-masked. All-caps (`MAY`) and lowercase variants of a single part are not masked unless the full name matches. `propagateNameParts: false` turns parts off.
+- **Restoration is lossy for variants.** Values that differ only in case or whitespace share one token and come back in the first-seen spelling.
+- **Content the wrapper can't read is rejected.** Images, PDFs, server-tool blocks and streaming throw `UnsupportedContentError` by default (`unsupportedContent: "passthrough"` overrides this). Thinking blocks pass through unchanged because their signatures forbid edits.
+- **Placeholders can be prompt-injected.** A user who types `{{PERSON_1}}` into a message gets it restored in the reply, but only to a value from the same request. Avoid putting values from two customers in one request.
+
+## Development
+
+```bash
+npm install
+npm test          # vitest
+npm run typecheck # strict tsc over src, test, examples
+npm run build     # emits dist/
+npm run example
+```
+
+The golden set in `test/fixtures/` contains insurance-flavoured texts with expected findings per category. All PII in it is fake: 555-01xx phone numbers, UK numbers from Ofcom's drama ranges (020 7946 0xxx, 07700 900xxx), `example.*` domains, test card numbers and synthetic VINs with valid check digits.
+
+## Layout
+
+```
+src/
+  detectors/   one file per category, plus overlap resolution
+  mask.ts      mask, maskAll, schema hints, propagation, policy
+  unmask.ts    unmask, unmaskDeep, near-match warnings
+  vault.ts     Vault, InMemoryVault, Redis contract
+  audit.ts     AuditLogger, JsonlAuditLogger, MemoryAuditLogger
+  anthropic.ts wrapAnthropic
+  core.ts      browser-safe entry (pii-gate/core)
+demo/          Next.js demo page (not part of the package)
+```

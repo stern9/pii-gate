@@ -1,0 +1,6 @@
+{
+  "name": "Property claim full of non-PII numbers",
+  "description": "Policy, claim and invoice numbers that look like phones/SSNs/cards; a non-DOB date; a 17-char part number with an I.",
+  "text": "Water damage claim. Policy number 4155550198. Claim no. 512-555-0147. Account # 078-05-1120.\nDate of loss: 01/22/2024. Inspection scheduled 01/29/2024.\nContractor invoice 4111111111111112 for $12,450. Replacement part SKU 1HGCM8263IA004352.\nRoof is 12 years old; 3 bedrooms affected.",
+  "expected": {}
+}

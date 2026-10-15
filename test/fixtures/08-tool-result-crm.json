@@ -1,0 +1,12 @@
+{
+  "name": "CRM lookup tool result (JSON as text)",
+  "text": "{\"client\":{\"name\":\"Mr. Kevin Osei\",\"email\":\"kevin.osei@example.com\",\"phone\":\"(214) 555-0133\",\"dob\":\"DOB 12/01/1990\",\"ssn\":\"SSN 456-78-9012\"},\"policies\":[{\"policy\":\"Policy # 2024-AUTO-55810\",\"vin\":\"1GNEK13Z92R000777\"}]}",
+  "expected": {
+    "PERSON": ["Kevin Osei"],
+    "EMAIL": ["kevin.osei@example.com"],
+    "PHONE": ["(214) 555-0133"],
+    "DOB": ["12/01/1990"],
+    "SSN": ["456-78-9012"],
+    "VIN": ["1GNEK13Z92R000777"]
+  }
+}
