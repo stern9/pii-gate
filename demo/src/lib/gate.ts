@@ -44,7 +44,7 @@ export const ACTIONS: readonly PolicyAction[] = ["mask", "block", "allow"];
 export const CATEGORIES: readonly BuiltInCategory[] = BUILT_IN_CATEGORIES;
 
 export const SYSTEM_PROMPT = `You help insurance claims adjusters triage incoming notes.
-Personal details in the note have been replaced with placeholders such as {{PERSON_1}} or {{PHONE_1}}. Use a placeholder exactly as written whenever you refer to that detail, and never guess what it stands for.
+Personal details in the note have been replaced with placeholders such as {{PERSON_n}} or {{PHONE_n}}, where n is a number. Use a placeholder exactly as written whenever you refer to that detail, and never guess what it stands for.
 Call create_follow_up_task once. Put a summary of two or three sentences for the adjuster in its summary field.`;
 
 export const FOLLOW_UP_TOOL: Anthropic.Beta.BetaTool = {

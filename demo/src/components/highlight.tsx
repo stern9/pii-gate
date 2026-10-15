@@ -1,4 +1,4 @@
-import type { Policy, PolicyAction } from "pii-gate/core";
+import { LITERAL_CATEGORY, type Policy, type PolicyAction } from "pii-gate/core";
 import type { Segment } from "@/lib/preview";
 import { cn } from "@/lib/utils";
 
@@ -12,6 +12,8 @@ const CATEGORY_STYLE: Record<string, string> = {
   DOB: "bg-violet-100 text-violet-950 dark:bg-violet-900/50 dark:text-violet-50",
   DRIVERS_LICENSE: "bg-orange-100 text-orange-950 dark:bg-orange-900/50 dark:text-orange-50",
   ADDRESS: "bg-lime-100 text-lime-950 dark:bg-lime-900/50 dark:text-lime-50",
+  // Escaped placeholder text, not PII: neutral, outlined so it doesn't read as a detected category.
+  [LITERAL_CATEGORY]: "bg-muted text-muted-foreground ring-1 ring-inset ring-border",
 };
 
 export function categoryStyle(category: string): string {
@@ -19,6 +21,7 @@ export function categoryStyle(category: string): string {
 }
 
 export function actionFor(category: string, policy: Policy): PolicyAction {
+  if (category === LITERAL_CATEGORY) return "mask";
   return policy[category] ?? "mask";
 }
 

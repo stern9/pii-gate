@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Policy, PolicyAction } from "pii-gate/core";
+import { LITERAL_CATEGORY, type Policy, type PolicyAction } from "pii-gate/core";
 import { ArrowRight, Ban, Lock, Send, ShieldCheck, TriangleAlert, Wrench } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -103,6 +103,8 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
   }
 
   function setAction(category: string, action: PolicyAction) {
+    // LITERAL (escaped placeholder text) ignores policy, and the live API rejects it.
+    if (category === LITERAL_CATEGORY) return;
     setPolicy((p) => ({ ...p, [category]: action }));
     reset();
   }
@@ -126,7 +128,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
       const res = await fetch("/api/run", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sampleId, policy }),
+        body: JSON.stringify({ sampleId, policy: withoutLiteral(policy) }),
       });
       const body: unknown = await res.json();
       if (res.ok) land(() => setRun(body as GateRun));
@@ -252,7 +254,13 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
                       <span className={cn("rounded px-1.5 py-0.5 font-mono text-xs", categoryStyle(category))}>{category}</span>
                       <span className="text-muted-foreground">{countLabel(category, count, view.distinct[category])}</span>
                     </span>
-                    <ActionPicker category={category} value={actionFor(category, policy)} onChange={setAction} />
+                    {category === LITERAL_CATEGORY ? (
+                      <span className="max-w-56 text-right text-xs text-muted-foreground">
+                        Placeholder-shaped text already in the note: escaped and always masked.
+                      </span>
+                    ) : (
+                      <ActionPicker category={category} value={actionFor(category, policy)} onChange={setAction} />
+                    )}
                   </li>
                 ))}
               </ul>
@@ -516,6 +524,11 @@ function ModelOption({
       {selected && children}
     </div>
   );
+}
+
+/** The policy as the live API accepts it: built-in categories only, never LITERAL. */
+function withoutLiteral(policy: Policy): Policy {
+  return Object.fromEntries(Object.entries(policy).filter(([category]) => category !== LITERAL_CATEGORY));
 }
 
 const ACTION_HELP: Record<PolicyAction, string> = {
