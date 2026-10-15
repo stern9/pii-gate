@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Policy, PolicyAction } from "pii-gate/core";
-import { ArrowRight, Ban, Lock, Send, ShieldCheck, TriangleAlert } from "lucide-react";
+import { ArrowRight, Ban, Lock, Send, ShieldCheck, TriangleAlert, Wrench } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,6 +34,8 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
   const [run, setRun] = useState<GateRun | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
+  const scrollNext = useRef(false); // scroll only after a run the visitor started
+  const epoch = useRef(0); // bumped on every change, so a stale run can't land
 
   const sample = SAMPLES.find((s) => s.id === sampleId);
   const isCustom = !sample;
@@ -43,12 +45,20 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
 
   // Bring the answer into view after Ask; jump instead of glide for reduced motion.
   useEffect(() => {
-    if (!run && !requestError) return;
+    if ((!run && !requestError) || !scrollNext.current) return;
+    scrollNext.current = false;
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     resultsRef.current?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
   }, [run, requestError]);
 
+  // Guided first run: the simulated model answers the default note, so every step is lit without a click.
+  useEffect(() => {
+    void ask("simulated", false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on the initial note
+  }, []);
+
   function reset() {
+    epoch.current++;
     setRun(null);
     setRequestError(null);
   }
@@ -71,12 +81,19 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
     reset();
   }
 
-  async function ask(useMode: Mode = effectiveMode) {
+  async function ask(useMode: Mode = effectiveMode, scroll = true) {
     setRunning(true);
     reset();
+    const at = epoch.current;
+    const land = (fn: () => void) => {
+      if (at !== epoch.current) return;
+      scrollNext.current = scroll;
+      fn();
+    };
     try {
       if (useMode === "simulated") {
-        setRun(await runGate(text, policy, "simulated", simulatedModel({ mangle })));
+        const result = await runGate(text, policy, "simulated", simulatedModel({ mangle }));
+        land(() => setRun(result));
         return;
       }
       const res = await fetch("/api/run", {
@@ -85,10 +102,10 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
         body: JSON.stringify({ sampleId, policy }),
       });
       const body: unknown = await res.json();
-      if (res.ok) setRun(body as GateRun);
-      else setRequestError((body as { message?: string }).message ?? `Request failed (${res.status}).`);
+      if (res.ok) land(() => setRun(body as GateRun));
+      else land(() => setRequestError((body as { message?: string }).message ?? `Request failed (${res.status}).`));
     } catch {
-      setRequestError("Couldn't reach the demo server.");
+      land(() => setRequestError("Couldn't reach the demo server."));
     } finally {
       setRunning(false);
     }
@@ -102,21 +119,19 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
   const detected = Object.entries(view.counts);
 
   return (
-    <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-10 sm:px-6">
+    <main className="mx-auto flex w-full max-w-6xl flex-col gap-5 px-4 py-6 sm:gap-6 sm:px-6 sm:py-10">
       <header className="flex flex-col gap-3">
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <ShieldCheck className="size-4" aria-hidden /> pii-gate
         </div>
-        <h1 className="text-3xl font-semibold tracking-tight text-balance">
+        <h1 className="text-2xl font-semibold sm:text-3xl tracking-tight text-balance">
           Use an LLM on claim notes without sending it the SSNs.
         </h1>
-        <div className="flex max-w-3xl flex-col gap-1 text-muted-foreground">
-          <p>
-            pii-gate swaps names, SSNs, VINs and card numbers for placeholders before the prompt leaves your process,
-            then puts the real values back in the reply. Try it on a note below.
-          </p>
-          <p className="text-sm">Most LLM tasks on this text (summarise, draft, route) don&apos;t need the real values.</p>
-        </div>
+        <p className="max-w-3xl text-muted-foreground">
+          pii-gate swaps names, SSNs, VINs and card numbers for placeholders before the prompt leaves your process, then
+          puts the real values back in the reply. Most LLM tasks on this text (summarise, draft, route) don&apos;t need
+          the real values.
+        </p>
         <Pipeline run={run} />
       </header>
 
@@ -142,7 +157,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
       <section className="grid items-stretch gap-4 lg:grid-cols-[1fr_auto_1fr]">
         <Card>
           <CardHeader>
-            <CardTitle>1. Your note</CardTitle>
+            <CardTitle>Your note</CardTitle>
             <CardDescription>{sample?.note ?? "Edit freely. Use made-up details."}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col gap-2">
@@ -152,7 +167,8 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
               maxLength={MAX_LENGTH}
               placeholder={CUSTOM_PLACEHOLDER}
               onChange={(e) => edit(e.target.value)}
-              className="min-h-72 flex-1 font-mono text-sm leading-7"
+              // Phones: about six lines, room to grow while editing.
+              className="flex-1 font-mono text-sm leading-7 transition-[max-height] max-sm:max-h-48 max-sm:focus:max-h-[32rem] sm:min-h-72"
             />
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <Lock className="size-3.5 shrink-0" aria-hidden />
@@ -167,9 +183,10 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
 
         <ArrowRight className="hidden size-6 self-center text-muted-foreground lg:block" aria-hidden />
 
-        <Card>
+        {/* First on phones: the masked result is the point of the page. */}
+        <Card className="max-sm:order-first">
           <CardHeader>
-            <CardTitle>2. What the model sees</CardTitle>
+            <CardTitle>What the model sees (steps 1–2)</CardTitle>
             <CardDescription>Updates as you type. Choose what happens to each kind of detail.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col gap-4">
@@ -179,6 +196,15 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
                 <span>
                   Your policy blocks {view.blocked.join(", ")}, so this request would not be sent. Use Mask to send a
                   placeholder instead.
+                </span>
+              </p>
+            )}
+            {sample?.shape === "tool_result" && sample.toolCall && (
+              <p className="flex items-start gap-2 text-xs text-muted-foreground">
+                <Wrench className="mt-px size-3.5 shrink-0" aria-hidden />
+                <span>
+                  Sent as a tool result: the user asked &ldquo;{sample.toolCall.ask}&rdquo;, the model called{" "}
+                  <code>{sample.toolCall.name}</code>, and this record came back.
                 </span>
               </p>
             )}
@@ -197,7 +223,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
                   <li key={category} className="flex items-center justify-between gap-3">
                     <span className="flex items-center gap-2 text-sm">
                       <span className={cn("rounded px-1.5 py-0.5 font-mono text-xs", categoryStyle(category))}>{category}</span>
-                      <span className="text-muted-foreground">×{count}</span>
+                      <span className="text-muted-foreground">{countLabel(category, count, view.distinct[category])}</span>
                     </span>
                     <ActionPicker category={category} value={actionFor(category, policy)} onChange={setAction} />
                   </li>
@@ -236,7 +262,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
 
       <Card>
         <CardHeader>
-          <CardTitle>Send the masked note to a model</CardTitle>
+          <CardTitle>Send to a model (step 3)</CardTitle>
           <CardDescription>
             The model gets the right-hand text, replies with placeholders, and pii-gate puts the real values back.
           </CardDescription>
@@ -272,7 +298,9 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
           </div>
           <Button className="self-start" size="lg" onClick={() => ask()} disabled={running || text.trim() === ""}>
             <Send aria-hidden />{" "}
-            {running ? "Asking…" : view.kind === "blocked" ? "Ask the model (will be blocked)" : "Ask the model"}
+            {running
+              ? "Asking…"
+              : `${run || requestError ? "Run again" : "Ask the model"}${view.kind === "blocked" ? " (will be blocked)" : ""}`}
           </Button>
         </CardContent>
       </Card>
@@ -313,46 +341,85 @@ function stepStates(run: GateRun | null): StepState[] {
   return ["on", "on", "skipped", "skipped", run.audit ? "on" : "skipped"];
 }
 
+/** Phones: a compact list. Wider: five equal-height chips joined by arrows. */
 function Pipeline({ run }: { run: GateRun | null }) {
   const states = stepStates(run);
   return (
-    <ol className="flex flex-wrap gap-x-1 gap-y-2 pt-1" aria-label="How pii-gate handles a request">
+    <ol className="grid gap-1.5 pt-1 sm:grid-cols-5 sm:gap-5" aria-label="How pii-gate handles a request">
       {STEPS.map((step, i) => {
         const state = states[i] as StepState;
         return (
-          <li key={step.name} className="flex flex-[1_1_10rem] items-center gap-1">
-            <div
+          <li
+            key={step.name}
+            className={cn(
+              "relative flex items-start gap-2 transition-colors sm:rounded-lg sm:border sm:px-2.5 sm:py-1.5",
+              state === "on" ? "sm:border-primary/40 sm:bg-primary/5" : "text-muted-foreground sm:border-dashed",
+              state === "skipped" && "opacity-50",
+            )}
+          >
+            <span
               className={cn(
-                "flex h-full flex-1 items-start gap-2 rounded-lg border px-2.5 py-1.5 transition-colors",
-                state === "on" ? "border-primary/40 bg-primary/5" : "border-dashed text-muted-foreground",
-                state === "skipped" && "opacity-50",
+                "flex size-5 shrink-0 items-center justify-center rounded-full text-xs font-semibold sm:mt-0.5",
+                state === "on" ? "bg-primary text-primary-foreground" : "border",
               )}
+              aria-hidden
             >
-              <span
-                className={cn(
-                  "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
-                  state === "on" ? "bg-primary text-primary-foreground" : "border",
-                )}
-                aria-hidden
-              >
-                {i + 1}
-              </span>
-              <span className="flex flex-col">
-                <span className={cn("text-sm font-medium", state === "skipped" && "line-through")}>
-                  {step.name}
-                  <span className="sr-only">
-                    {state === "on" ? " (done)" : state === "skipped" ? " (skipped)" : " (after you ask)"}
-                  </span>
+              {i + 1}
+            </span>
+            <span className="flex flex-wrap items-baseline gap-x-2 max-sm:pt-px sm:flex-col">
+              <span className={cn("text-sm font-medium", state === "skipped" && "line-through")}>
+                {step.name}
+                <span className="sr-only">
+                  {state === "on" ? " (done)" : state === "skipped" ? " (skipped)" : " (after you ask)"}
                 </span>
-                <span className="text-xs leading-4 text-muted-foreground">{step.body}</span>
               </span>
-            </div>
-            {i < STEPS.length - 1 && <ArrowRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
+              <span className="text-xs leading-4 text-muted-foreground">{step.body}</span>
+            </span>
+            {i < STEPS.length - 1 && (
+              <ArrowRight
+                className="absolute top-1/2 -right-[1.125rem] hidden size-4 -translate-y-1/2 text-muted-foreground sm:block"
+                aria-hidden
+              />
+            )}
           </li>
         );
       })}
     </ol>
   );
+}
+
+/** Short label on phones, long one from 640px. */
+function Short({ short, long }: { short: string; long: string }) {
+  return (
+    <>
+      <span className="sm:hidden" aria-hidden>
+        {short}
+      </span>
+      <span className="max-sm:sr-only">{long}</span>
+    </>
+  );
+}
+
+const NOUNS: Record<string, [string, string]> = {
+  PERSON: ["person", "people"],
+  SSN: ["SSN", "SSNs"],
+  PHONE: ["phone number", "phone numbers"],
+  EMAIL: ["email address", "email addresses"],
+  VIN: ["VIN", "VINs"],
+  CREDIT_CARD: ["card number", "card numbers"],
+  DOB: ["date of birth", "dates of birth"],
+  DRIVERS_LICENSE: ["license", "licenses"],
+  ADDRESS: ["address", "addresses"],
+};
+
+/** "3 mentions · 1 person": mentions vs distinct values (placeholders). Allowed values have no placeholder. */
+function countLabel(category: string, mentions: number, distinct?: number): string {
+  const [one, many] = NOUNS[category] ?? ["value", "values"];
+  const noun = (n: number) => `${n} ${n === 1 ? one : many}`;
+  const said = `${mentions} ${mentions === 1 ? "mention" : "mentions"}`;
+  // Allowed values get no placeholder, so count them as values: "1 SSN", "3 mentions" for repeats.
+  if (distinct === undefined) return mentions === 1 ? noun(1) : said;
+  return distinct === mentions ? noun(distinct) : `${said} · ${noun(distinct)}`;
 }
 
 function ModelOption({
@@ -458,11 +525,19 @@ function LiveUnavailable({ reason, onSimulate }: { reason: string; onSimulate: (
   );
 }
 
-function ResultCard({ description, children }: { description: string; children: React.ReactNode }) {
+/** `model` labels a reply's source; omitted when nothing reached a model. */
+function ResultCard({ model, description, children }: { model?: string; description: string; children: React.ReactNode }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>3. What came back</CardTitle>
+        <CardTitle className="flex flex-wrap items-baseline gap-x-2">
+          What came back (steps 4–5)
+          {model && (
+            <span className="text-xs font-normal text-muted-foreground">
+              from {model === "simulated" ? "the simulated model" : model}
+            </span>
+          )}
+        </CardTitle>
         <CardDescription>{description}</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">{children}</CardContent>
@@ -506,7 +581,7 @@ function Results({ run, onSimulate }: { run: GateRun; onSimulate: () => void }) 
   }
 
   return (
-    <ResultCard description="The model's reply, the same reply with real values restored, and the audit row.">
+    <ResultCard model={run.audit.model} description="The model's reply, the same reply with real values restored, and the audit row.">
       {run.stopReason === "refusal" && (
         <Alert variant="destructive">
           <TriangleAlert aria-hidden />
@@ -531,9 +606,15 @@ function Results({ run, onSimulate }: { run: GateRun; onSimulate: () => void }) 
       )}
       <Tabs defaultValue="restored">
         <TabsList className="max-w-full flex-wrap group-data-horizontal/tabs:h-auto">
-          <TabsTrigger value="reply">Model&apos;s reply (placeholders)</TabsTrigger>
-          <TabsTrigger value="restored">Restored (what your app gets)</TabsTrigger>
-          <TabsTrigger value="audit">Audit row</TabsTrigger>
+          <TabsTrigger value="reply">
+            <Short short="Reply" long="Model's reply (placeholders)" />
+          </TabsTrigger>
+          <TabsTrigger value="restored">
+            <Short short="Restored" long="Restored (what your app gets)" />
+          </TabsTrigger>
+          <TabsTrigger value="audit">
+            <Short short="Audit" long="Audit row" />
+          </TabsTrigger>
         </TabsList>
         <TabsContent value="reply" className="pt-3">
           <p className="mb-3 text-sm text-muted-foreground">Exactly what came back from the model: placeholders only.</p>

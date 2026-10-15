@@ -10,7 +10,10 @@ export type Segment =
 export type Preview = {
   kind: "masked" | "blocked";
   segments: Segment[];
+  /** Mentions per detected category. */
   counts: Record<string, number>;
+  /** Distinct placeholder tokens per masked category (one per distinct value). */
+  distinct: Record<string, number>;
   /** Detected categories whose policy is "allow" (sent in clear text). */
   allowed: string[];
   /** Categories that block the request (empty unless kind is "blocked"). */
@@ -70,10 +73,13 @@ export function preview(text: string, policy: Policy): Preview {
     result = mask(text, { policy: asMask });
   }
   const kept = keptSpans(text, result.findings);
+  const tokens = new Map<string, Set<string>>();
+  for (const f of result.findings) if (f.token) tokens.set(f.category, (tokens.get(f.category) ?? new Set()).add(f.token));
   return {
     kind: blocked.length > 0 ? "blocked" : "masked",
     segments: segments(text, result.findings, kept),
     counts,
+    distinct: Object.fromEntries([...tokens].map(([c, t]) => [c, t.size])),
     allowed,
     blocked,
     hasKept: kept.length > 0,

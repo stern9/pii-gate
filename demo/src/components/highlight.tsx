@@ -72,7 +72,7 @@ export function TokenText({
 }) {
   return (
     <pre className={cn("whitespace-pre-wrap break-words font-mono text-sm leading-7", className)}>
-      {text.split(TOKEN).flatMap((part, i) => {
+      {text.split(TOKEN).flatMap<React.ReactNode>((part, i) => {
         const m = /^\{\{([A-Z][A-Z0-9_]*)_\d+\}\}$/.exec(part);
         if (!m) return withValues(part, values, String(i));
         return [
