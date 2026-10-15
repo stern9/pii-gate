@@ -44,14 +44,26 @@ export interface Finding {
  * Pluggable detector. Built-ins are regex-based; an NER model, a cloud DLP
  * service or a dictionary lookup can implement the same shape.
  *
- * Detectors are synchronous so `mask()` can stay synchronous. For an async
- * detector (remote NER), run it first and feed the results in through
- * `staticDetector()`.
+ * Detectors are synchronous so `mask()` can stay synchronous. An async
+ * detector (remote or in-process NER) is an `AsyncDetector`, used through
+ * `maskAsync`, `maskAllAsync` or `wrapAnthropic` (ADR 0004).
  */
 export interface Detector {
   readonly name: string;
   readonly categories: readonly Category[];
   detect(text: string): Finding[];
+}
+
+/**
+ * A detector that may resolve its findings asynchronously. Every `Detector`
+ * is also an `AsyncDetector`. Accepted by `maskAsync`, `maskAllAsync` and
+ * `wrapAnthropic`; the synchronous `mask`/`maskAll` reject a detector that
+ * returns a promise.
+ */
+export interface AsyncDetector {
+  readonly name: string;
+  readonly categories: readonly Category[];
+  detect(text: string): Finding[] | PromiseLike<Finding[]>;
 }
 
 export type PolicyAction = "mask" | "block" | "allow";

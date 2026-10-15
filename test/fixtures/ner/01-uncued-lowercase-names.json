@@ -1,0 +1,16 @@
+{
+  "name": "Adjuster note with uncued, lowercase names (NER)",
+  "description": "Run with nerDetector over a stub recognizer that knows `nerNames` (case-insensitive). Regex alone misses the uncued 'jordan ellery' and its capitalised repeat; with NER both are masked, the cued claimant is still found by regex, her first name propagates, and the policy number stays.",
+  "nerNames": ["jordan ellery"],
+  "text": "ADJUSTER NOTE — Claim # CLM-77120. Policy No. 512-555-0147.\nspoke with jordan ellery at the body shop; the estimate is approved. Claimant: Priya Natarajan, phone (512) 555-0143.\nLeft a voicemail for Jordan Ellery about the rental. Priya will send photos to priya.n@example.com.",
+  "expectedWithoutNer": {
+    "PERSON": ["Priya Natarajan", "Priya"],
+    "PHONE": ["(512) 555-0143"],
+    "EMAIL": ["priya.n@example.com"]
+  },
+  "expected": {
+    "PERSON": ["jordan ellery", "Priya Natarajan", "Jordan Ellery", "Priya"],
+    "PHONE": ["(512) 555-0143"],
+    "EMAIL": ["priya.n@example.com"]
+  }
+}

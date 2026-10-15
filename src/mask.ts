@@ -1,7 +1,7 @@
-import { defaultDetectors, resolveOverlaps } from "./detectors/index.js";
+import { defaultDetectors, findingsOf, resolveOverlaps } from "./detectors/index.js";
 import { PiiBlockedError } from "./errors.js";
 import { LITERAL_CATEGORY, addCount, assertValidCategory, nullRecord } from "./types.js";
-import type { Category, Detector, Finding, Policy, PolicyAction } from "./types.js";
+import type { AsyncDetector, Category, Detector, Finding, Policy, PolicyAction } from "./types.js";
 import { InMemoryVault, normalizeValue, type Vault } from "./vault.js";
 
 /** A known value from a structured record, masked without relying on detection. */
@@ -61,6 +61,15 @@ export interface MaskOptions {
   keepIssuedPlaceholders?: boolean;
 }
 
+/**
+ * Options for `maskAsync` / `maskAllAsync`: the same as `MaskOptions`, except
+ * that detectors may be asynchronous (an NER model or service, ADR 0004).
+ */
+export interface MaskAsyncOptions extends Omit<MaskOptions, "detectors"> {
+  /** Default: all built-in detectors. Pass `[...defaultDetectors(), nerDetector({ recognize })]` to add NER. */
+  detectors?: readonly AsyncDetector[];
+}
+
 export interface MaskFinding extends Finding {
   action: PolicyAction;
   /** Placeholder that replaced the value; absent when the action was "allow". */
@@ -91,7 +100,7 @@ const PLACEHOLDER = /\{\{\s*[A-Za-z][A-Za-z0-9_]*_\d+\s*\}\}/g;
  */
 function placeholderSpans(
   text: string,
-  options: MaskOptions,
+  options: Pick<MaskOptions, "escapePlaceholders" | "keepIssuedPlaceholders">,
   issued: ReadonlySet<string>,
 ): { literals: Finding[]; kept: Finding[] } {
   const literals: Finding[] = [];
@@ -112,7 +121,7 @@ function placeholderSpans(
 }
 
 /** Tokens the vault holds right now; taken before a call allocates anything. */
-function issuedTokens(vault: Vault | undefined, options: MaskOptions): ReadonlySet<string> {
+function issuedTokens(vault: Vault | undefined, options: Pick<MaskOptions, "keepIssuedPlaceholders">): ReadonlySet<string> {
   if (!vault || options.keepIssuedPlaceholders !== true) return new Set();
   return new Set(vault.entries().map((e) => e.token));
 }
@@ -139,9 +148,17 @@ function findOccurrences(
   exactCase = false,
 ): Finding[] {
   const findings: Finding[] = [];
-  for (const m of text.matchAll(occurrencePattern(value, exactCase))) {
-    const start = m.index;
-    findings.push({ category, start, end: start + m[0].length, value: m[0], confidence, detector });
+  try {
+    // V8 compiles a pattern on first use, so "regular expression too large" can come from either step.
+    for (const m of text.matchAll(occurrencePattern(value, exactCase))) {
+      const start = m.index;
+      findings.push({ category, start, end: start + m[0].length, value: m[0], confidence, detector });
+    }
+  } catch {
+    // The engine's error quotes the whole pattern, i.e. the value. Never rethrow or chain it.
+    throw new RangeError(
+      `pii-gate: a ${category} value of ${value.length} characters is too long to search for; refusing to continue with possibly unmasked text.`,
+    );
   }
   return findings;
 }
@@ -246,7 +263,39 @@ function withNameParts(seeds: readonly Seed[]): ExpandedSeed[] {
  * a hint are dropped.
  */
 export function detectFindings(text: string, options: MaskOptions = {}): Finding[] {
-  return analyze(text, options, issuedTokens(options.vault, options)).findings;
+  return analyze(text, options, issuedTokens(options.vault, options), runDetectors(text, options.detectors)).findings;
+}
+
+/** Raw output of synchronous detectors. Rejects a detector that returns a promise (or anything but an array). */
+function runDetectors(text: string, detectors: readonly Detector[] | undefined): Finding[] {
+  return (detectors ?? defaultDetectors()).flatMap((d) => findingsOf(d, d.detect(text)));
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object" && value !== null && typeof (value as { then?: unknown }).then === "function";
+}
+
+/**
+ * Raw output of possibly-async detectors; all detectors for one text run
+ * concurrently. Returns synchronously when no detector returned a promise, so
+ * regex-only callers of the async API pay no extra microtasks.
+ */
+function runDetectorsAsync(
+  text: string,
+  detectors: readonly AsyncDetector[] | undefined,
+): Finding[] | Promise<Finding[]> {
+  const list = detectors ?? defaultDetectors();
+  // A synchronous throw becomes a rejection, so promises already started by other detectors are still awaited by Promise.all (no unhandled rejection).
+  const outs = list.map((d) => {
+    try {
+      return d.detect(text);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  });
+  const flatten = (results: readonly unknown[]): Finding[] =>
+    results.flatMap((out, i) => findingsOf(list[i] ?? { name: "(unnamed)" }, out));
+  return outs.some(isThenable) ? Promise.all(outs).then(flatten) : flatten(outs);
 }
 
 interface Analysis {
@@ -256,12 +305,15 @@ interface Analysis {
   occupied: Finding[];
 }
 
-function analyze(text: string, options: MaskOptions, issued: ReadonlySet<string>): Analysis {
+/**
+ * `raw` is the detectors' output for `text`, computed by the caller (synchronously
+ * for `mask`, awaited for `maskAsync`), so both paths share everything after detection.
+ */
+function analyze(text: string, options: MaskAsyncOptions, issued: ReadonlySet<string>, raw: readonly Finding[]): Analysis {
   const { literals, kept } = placeholderSpans(text, options, issued);
   const reserved = [...literals, ...kept];
   const hints = resolveOverlaps(hintFindings(text, options.schemaHints).filter((f) => !overlapsAny(f, reserved)));
   const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
-  const raw = (options.detectors ?? defaultDetectors()).flatMap((d) => d.detect(text));
   for (const f of raw) assertValidCategory(f.category);
   const detected = raw.filter(
     (f) => f.confidence >= minConfidence && !overlapsAny(f, hints) && !overlapsAny(f, reserved),
@@ -272,7 +324,11 @@ function analyze(text: string, options: MaskOptions, issued: ReadonlySet<string>
 
 /** Final, non-overlapping findings for a single text, sorted by position. */
 export function collectFindings(text: string, options: MaskOptions = {}): Finding[] {
-  const { findings, occupied } = analyze(text, options, issuedTokens(options.vault, options));
+  const raw = runDetectors(text, options.detectors);
+  return withPropagation(text, options, analyze(text, options, issuedTokens(options.vault, options), raw));
+}
+
+function withPropagation(text: string, options: MaskAsyncOptions, { findings, occupied }: Analysis): Finding[] {
   if (options.propagate === false) return findings;
   return [...findings, ...propagateFindings(text, findings, occupied, options)].sort((a, b) => a.start - b.start);
 }
@@ -289,13 +345,21 @@ export function countByCategory(findings: readonly Pick<Finding, "category">[]):
   return counts;
 }
 
-export function assertNotBlocked(findings: readonly Finding[], options: MaskOptions): void {
+export function assertNotBlocked(
+  findings: readonly Finding[],
+  options: Pick<MaskOptions, "policy" | "defaultAction">,
+): void {
   const blocked = findings.filter((f) => actionFor(f.category, options) === "block");
   if (blocked.length > 0) throw new PiiBlockedError(countByCategory(blocked));
 }
 
 /** Replaces precomputed, non-overlapping, position-sorted findings with vault tokens according to policy. */
-export function applyFindings(text: string, findings: readonly Finding[], vault: Vault, options: MaskOptions): MaskResult {
+export function applyFindings(
+  text: string,
+  findings: readonly Finding[],
+  vault: Vault,
+  options: Pick<MaskOptions, "policy" | "defaultAction">,
+): MaskResult {
   const out: string[] = [];
   const results: MaskFinding[] = [];
   let cursor = 0;
@@ -322,6 +386,21 @@ export function applyFindings(text: string, findings: readonly Finding[], vault:
 export function mask(text: string, options: MaskOptions = {}): MaskResult {
   const vault = options.vault ?? new InMemoryVault();
   const findings = collectFindings(text, options);
+  assertNotBlocked(findings, options);
+  return applyFindings(text, findings, vault, options);
+}
+
+/**
+ * `mask` with detectors that may be asynchronous (ADR 0004). With only
+ * synchronous detectors the result is identical to `mask`. A detector that
+ * rejects (e.g. `nerDetector` with `onError: "throw"`) rejects the call
+ * before any token is issued.
+ */
+export async function maskAsync(text: string, options: MaskAsyncOptions = {}): Promise<MaskResult> {
+  const vault = options.vault ?? new InMemoryVault();
+  const issued = issuedTokens(vault, options);
+  const raw = await runDetectorsAsync(text, options.detectors);
+  const findings = withPropagation(text, options, analyze(text, options, issued, raw));
   assertNotBlocked(findings, options);
   return applyFindings(text, findings, vault, options);
 }
@@ -362,10 +441,47 @@ export interface MaskInput {
 export function maskTexts(inputs: readonly MaskInput[], options: MaskOptions = {}): MaskAllResult {
   const vault = options.vault ?? new InMemoryVault();
   const issued = new Set(vault.entries().map((e) => e.token));
+  const raws = inputs.map((input) => runDetectors(input.text, options.detectors));
+  return maskAnalyzed(inputs, options, vault, issued, raws);
+}
+
+/**
+ * `maskAll` with detectors that may be asynchronous (ADR 0004). Detection for
+ * every text runs concurrently and completes before anything is replaced, so
+ * the cross-text guarantees of `maskAll` hold: a block anywhere aborts the
+ * request before any token is issued, and a name an NER detector finds in one
+ * text is propagated to the others. With only synchronous detectors the result
+ * is identical to `maskAll`.
+ */
+export async function maskAllAsync(texts: readonly string[], options: MaskAsyncOptions = {}): Promise<MaskAllResult> {
+  return maskTextsAsync(
+    texts.map((text) => ({ text })),
+    options,
+  );
+}
+
+/** `maskTexts` with possibly-async detectors; used by `wrapAnthropic`. */
+export async function maskTextsAsync(inputs: readonly MaskInput[], options: MaskAsyncOptions = {}): Promise<MaskAllResult> {
+  const vault = options.vault ?? new InMemoryVault();
+  // Snapshot before awaiting detection: tokens a concurrent call allocates meanwhile never count as issued.
+  const issued = new Set(vault.entries().map((e) => e.token));
+  const pending = inputs.map((input) => runDetectorsAsync(input.text, options.detectors));
+  const raws = pending.some(isThenable) ? await Promise.all(pending) : (pending as Finding[][]);
+  return maskAnalyzed(inputs, options, vault, issued, raws);
+}
+
+/** Everything after detection, shared by the sync and async paths. */
+function maskAnalyzed(
+  inputs: readonly MaskInput[],
+  options: MaskAsyncOptions,
+  vault: Vault,
+  issued: ReadonlySet<string>,
+  raws: readonly (readonly Finding[])[],
+): MaskAllResult {
   const none: ReadonlySet<string> = new Set();
-  const analyses = inputs.map((input) => {
+  const analyses = inputs.map((input, i) => {
     const keep = input.keepIssuedPlaceholders ?? options.keepIssuedPlaceholders ?? false;
-    return analyze(input.text, { ...options, keepIssuedPlaceholders: keep }, keep ? issued : none);
+    return analyze(input.text, { ...options, keepIssuedPlaceholders: keep }, keep ? issued : none, raws[i] ?? []);
   });
   const base = analyses.map((a) => a.findings);
   const perText =

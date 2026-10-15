@@ -19,6 +19,17 @@ export { phoneDetector } from "./phone.js";
 export { regexDetector, type RegexDetectorSpec, type RegexRule, type MatchContext } from "./regex.js";
 export { ssnDetector } from "./ssn.js";
 export { isValidVinCheckDigit, vinDetector, type VinDetectorOptions } from "./vin.js";
+export {
+  NerDetectorError,
+  nerDetector,
+  type NerDetectorOptions,
+  type NerEntity,
+  type NerFailure,
+  type NerFailureReason,
+  type NerRecognize,
+  type NerRecognizeContext,
+  type NerRecognizeSync,
+} from "./ner.js";
 
 export function defaultDetectors(): Detector[] {
   return [
@@ -71,6 +82,18 @@ export function resolveOverlaps(findings: readonly Finding[]): Finding[] {
   return kept.sort((a, b) => a.start - b.start);
 }
 
+/**
+ * The output of a synchronous detector, or a TypeError naming the detector
+ * (configuration, never input text) when it returned a promise or anything else.
+ * @internal
+ */
+export function findingsOf(detector: { readonly name: string }, out: unknown): Finding[] {
+  if (Array.isArray(out)) return out as Finding[];
+  throw new TypeError(
+    `Detector "${detector.name}" did not return an array of findings. Async detectors (e.g. nerDetector) need maskAsync, maskAllAsync or wrapAnthropic.`,
+  );
+}
+
 export interface DetectOptions {
   detectors?: readonly Detector[];
   /** Findings below this confidence are discarded before overlap resolution. Default 0.5. */
@@ -80,7 +103,7 @@ export interface DetectOptions {
 export function detect(text: string, options: DetectOptions = {}): Finding[] {
   const detectors = options.detectors ?? defaultDetectors();
   const minConfidence = options.minConfidence ?? 0.5;
-  const raw = detectors.flatMap((d) => d.detect(text)).filter((f) => f.confidence >= minConfidence);
+  const raw = detectors.flatMap((d) => findingsOf(d, d.detect(text))).filter((f) => f.confidence >= minConfidence);
   return resolveOverlaps(raw);
 }
 

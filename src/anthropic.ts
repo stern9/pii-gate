@@ -1,6 +1,6 @@
 import type { AuditLogger, AuditRecord } from "./audit.js";
 import { PiiBlockedError, PiiGateInvariantError, UnsupportedContentError } from "./errors.js";
-import { countByCategory, maskTexts, type MaskInput, type MaskOptions } from "./mask.js";
+import { countByCategory, maskTextsAsync, type MaskAsyncOptions, type MaskInput } from "./mask.js";
 import { LITERAL_CATEGORY, addCount, assertValidCategory, nullRecord, type Category } from "./types.js";
 import { countTokens, unmask, unmaskDeep, type UnmaskWarning } from "./unmask.js";
 import { InMemoryVault, type Vault } from "./vault.js";
@@ -55,7 +55,11 @@ export type RestoreToolInputs =
   | Readonly<Record<string, boolean | readonly Category[]>>
   | ToolRestorePredicate;
 
-export interface WrapAnthropicOptions extends Omit<MaskOptions, "vault" | "keepIssuedPlaceholders"> {
+/**
+ * `detectors` may include async detectors such as `nerDetector` (ADR 0004):
+ * every string in the request is run through them before anything is sent.
+ */
+export interface WrapAnthropicOptions extends Omit<MaskAsyncOptions, "vault" | "keepIssuedPlaceholders"> {
   audit?: AuditLogger;
   /** Default: crypto.randomUUID(). */
   requestId?: () => string;
@@ -207,10 +211,13 @@ function traversalMismatch(detail: string): PiiGateInvariantError {
   return new PiiGateInvariantError(`pii-gate internal invariant violated: params changed between traversals (${detail}); refusing to send.`);
 }
 
-function maskParams<P extends CreateParamsLike>(params: P, options: WrapAnthropicOptions, vault: Vault) {
+async function maskParams<P extends CreateParamsLike>(params: P, options: WrapAnthropicOptions, vault: Vault) {
   const unsupported = options.unsupportedContent ?? "throw";
   const inputs = collectStrings(params, unsupported);
-  const result = maskTexts(inputs, { ...options, vault });
+  // The second traversal below substitutes these results by position and never reads
+  // the strings again, so a caller mutating `params` while detection is awaited cannot
+  // slip unmasked text through.
+  const result = await maskTextsAsync(inputs, { ...options, vault });
   let i = 0;
   const masked = mapParams(
     params,
@@ -379,7 +386,7 @@ export function wrapAnthropic<P extends CreateParamsLike = CreateParamsLike, R e
     try {
       if (params.stream) throw new UnsupportedContentError("streaming requests");
       vault = options.createVault?.() ?? new InMemoryVault();
-      ({ masked, categoryCounts: record.categoryCounts } = maskParams(params, options, vault));
+      ({ masked, categoryCounts: record.categoryCounts } = await maskParams(params, options, vault));
     } catch (err) {
       await finishAfterError(
         err instanceof PiiBlockedError
