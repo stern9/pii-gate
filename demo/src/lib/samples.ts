@@ -10,7 +10,16 @@ export interface Sample {
   text: string;
   /** Shown under the sample when it demonstrates something specific. */
   note?: string;
+  /**
+   * How the text reaches the model. "note" (default): one user message.
+   * "tool_result": an agent loop where `text` is the result of a tool call.
+   */
+  shape?: SampleShape;
+  /** For shape "tool_result": the user's request and the tool call that fetched `text`. */
+  toolCall?: { ask: string; name: string; input: Record<string, string> };
 }
+
+export type SampleShape = "note" | "tool_result";
 
 export const SAMPLES: readonly Sample[] = [
   {
@@ -49,6 +58,13 @@ Thanks, Priya Natarajan`,
     id: "crm-tool-result",
     title: "CRM lookup (tool result)",
     kind: "System record",
+    note: "Sent the way an agent loop sees it: the CRM record comes back as the result of a lookup_customer tool call. pii-gate masks tool results and tool inputs in the history too.",
+    shape: "tool_result",
+    toolCall: {
+      ask: "Triage customer CUST-48201's account and open a follow-up task for the adjuster.",
+      name: "lookup_customer",
+      input: { customer_id: "CUST-48201" },
+    },
     text: `{"record":"CUST-48201","name":"Tomasz Kowalski","contact":"tomasz.k@example.net","phone":"(212) 555-0164","dob":"DOB 07/19/1990","notes":"Contact: Tomasz Kowalski. Kowalski prefers email. Account 4471-2290 in good standing."}`,
   },
   {

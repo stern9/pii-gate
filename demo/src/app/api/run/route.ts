@@ -42,6 +42,6 @@ export async function POST(request: Request): Promise<Response> {
   const policy = parsePolicy(rawPolicy ?? {});
   if (!policy) return fail(400, "Invalid policy.");
 
-  const run = await runGate(sample.text, policy, LIVE_MODEL, liveModel);
+  const run = await runGate(sample.text, policy, LIVE_MODEL, liveModel, { sampleId: sample.id });
   return Response.json(run);
 }

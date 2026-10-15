@@ -11,6 +11,7 @@ import {
   type PolicyAction,
   type UnmaskWarning,
 } from "pii-gate/core";
+import { SAMPLES, type Sample, type SampleShape } from "./samples";
 
 /*
  * One run of the demo: note -> wrapAnthropic -> model -> restored reply.
@@ -27,7 +28,7 @@ export interface DemoParams extends CreateParamsLike {
   model: string;
   max_tokens: number;
   system: string;
-  messages: { role: "user"; content: string }[];
+  messages: Anthropic.Beta.BetaMessageParam[];
   tools: Anthropic.Beta.BetaTool[];
 }
 
@@ -63,21 +64,80 @@ export const FOLLOW_UP_TOOL: Anthropic.Beta.BetaTool = {
   strict: true,
 };
 
-export function buildParams(note: string, model: string): DemoParams {
+export const LOOKUP_TOOL: Anthropic.Beta.BetaTool = {
+  name: "lookup_customer",
+  description: "Fetch a customer's record from the CRM by customer id.",
+  input_schema: {
+    type: "object",
+    properties: { customer_id: { type: "string", description: "CRM customer id, e.g. CUST-10001." } },
+    required: ["customer_id"],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+
+const TOOL_USE_ID = "toolu_demo_lookup_1";
+
+/** A sample's text, sent as one user message ("note") or replayed as an agent loop that already called a tool. */
+export function buildParams(note: string, model: string, sample?: Sample): DemoParams {
+  const base = { model, max_tokens: 4000, system: SYSTEM_PROMPT };
+  const call = sample?.shape === "tool_result" ? sample.toolCall : undefined;
+  if (!call) return { ...base, messages: [{ role: "user", content: `Triage this note:\n\n${note}` }], tools: [FOLLOW_UP_TOOL] };
+  // user asks -> assistant calls the tool -> user returns the record. wrapAnthropic masks all three turns.
   return {
-    model,
-    max_tokens: 4000,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: `Triage this note:\n\n${note}` }],
-    tools: [FOLLOW_UP_TOOL],
+    ...base,
+    messages: [
+      { role: "user", content: call.ask },
+      { role: "assistant", content: [{ type: "tool_use", id: TOOL_USE_ID, name: call.name, input: call.input }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: TOOL_USE_ID, content: note }] },
+    ],
+    tools: [LOOKUP_TOOL, FOLLOW_UP_TOOL],
   };
+}
+
+/** What crossed the boundary, flattened for display. */
+function sentView(params: DemoParams | undefined): Extract<GateRun, { ok: true }>["sent"] {
+  const view: Extract<GateRun, { ok: true }>["sent"] = { system: params?.system ?? "", user: "" };
+  for (const m of params?.messages ?? []) {
+    if (typeof m.content === "string") {
+      if (m.role === "user" && !view.user) view.user = m.content;
+      continue;
+    }
+    for (const b of m.content) {
+      if (b.type === "tool_use") view.toolUse = { name: b.name, input: b.input };
+      if (b.type === "tool_result") {
+        view.shape = "tool_result";
+        view.toolResult =
+          typeof b.content === "string" ? b.content : (b.content ?? []).flatMap((c) => (c.type === "text" ? [c.text] : [])).join("\n");
+      }
+    }
+  }
+  return view;
+}
+
+export interface RunOptions {
+  /**
+   * The built-in sample this text came from. Defaults to the sample whose text
+   * matches exactly, so an edited sample is sent as a plain note.
+   */
+  sampleId?: string;
 }
 
 export type GateRun =
   | {
       ok: true;
       /** Exactly what crossed the boundary to the model. */
-      sent: { system: string; user: string };
+      sent: {
+        system: string;
+        /** The user's own message (the note, or the request that started the agent loop). */
+        user: string;
+        /** "tool_result" when the note was replayed as a tool result; absent for a plain note. */
+        shape?: SampleShape;
+        /** The earlier tool call in the history, inputs masked. */
+        toolUse?: { name: string; input: unknown };
+        /** The masked tool_result content (the CRM record as the model saw it). */
+        toolResult?: string;
+      };
       /** The model's reply before restoration (placeholders intact). */
       raw: Block[];
       restored: Block[];
@@ -100,12 +160,25 @@ export type GateRun =
       audit?: AuditRecord;
     };
 
-/** Only the blocks a reader cares about: text and tool calls (drops empty thinking blocks). */
+/** Only the blocks a reader cares about: non-empty text and tool calls (drops thinking blocks). */
 function visible(blocks: readonly Block[]): Block[] {
-  return blocks.filter((b) => b.type === "text" || b.type === "tool_use");
+  return blocks.filter((b) => b.type === "tool_use" || (b.type === "text" && typeof b.text === "string" && b.text.trim() !== ""));
 }
 
-export async function runGate(note: string, policy: Policy, model: string, create: CreateFn): Promise<GateRun> {
+/** Never hand the page an empty reply: say why there is nothing (no values in it, only the stop reason). */
+function orNotice(blocks: Block[], stopReason: string | null): Block[] {
+  if (blocks.length > 0) return blocks;
+  return [{ type: "text", text: `(The model returned no text or tool call. Stop reason: ${stopReason ?? "none"}.)` }];
+}
+
+export async function runGate(
+  note: string,
+  policy: Policy,
+  model: string,
+  create: CreateFn,
+  options: RunOptions = {},
+): Promise<GateRun> {
+  const sample = options.sampleId !== undefined ? SAMPLES.find((s) => s.id === options.sampleId) : SAMPLES.find((s) => s.text === note);
   const records: AuditRecord[] = [];
   let sent: DemoParams | undefined;
   let raw: DemoMessage | undefined;
@@ -127,16 +200,17 @@ export async function runGate(note: string, policy: Policy, model: string, creat
   const gate = wrapAnthropic<DemoParams, DemoMessage>(spy, { policy, audit: { write: (r) => void records.push(r) } });
 
   try {
-    const { message, report } = await gate.messages.createWithReport(buildParams(note, model));
+    const { message, report } = await gate.messages.createWithReport(buildParams(note, model, sample));
+    const stopReason = message.stop_reason ?? null;
     return {
       ok: true,
-      sent: { system: sent?.system ?? "", user: sent?.messages[0]?.content ?? "" },
-      raw: visible(raw?.content ?? []),
-      restored: visible(message.content),
+      sent: sentView(sent),
+      raw: orNotice(visible(raw?.content ?? []), stopReason),
+      restored: orNotice(visible(message.content), stopReason),
       restoredValues: report.vault.entries().map(({ token, category, value }) => ({ token, category, value })),
       warnings: report.warnings,
       audit: records[0] as AuditRecord,
-      stopReason: message.stop_reason ?? null,
+      stopReason,
     };
   } catch (err) {
     const name = err instanceof Error ? err.name : "UnknownError";
