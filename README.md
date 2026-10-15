@@ -2,7 +2,7 @@
 
 A small TypeScript library that sits between your application and an LLM API. It finds personal data in outgoing prompts, swaps it for typed placeholders (`{{PERSON_1}}`, `{{SSN_1}}`), sends the masked request, then puts the original values back into the model's reply and tool calls. Insurance work is full of exactly this data. Claims notes, policy emails and client records carry names, SSNs, VINs, dates of birth and addresses. Most useful LLM tasks on that text (summarising a loss, drafting a renewal letter, routing a FNOL) don't need the actual values. pii-gate lets you use a hosted model on that text while keeping the identifiers in your own process. It also writes an audit trail of what was masked, and it never records the values themselves.
 
-**Live demo:** [pii-gate-eight.vercel.app](https://pii-gate-eight.vercel.app). Run a fictional claim note through the gate and see what the model receives, what it replies and what comes back.
+**Live demo:** [pii-gate.vercel.app](https://pii-gate.vercel.app). Run a fictional claim note through the gate and see what the model receives, what it replies and what comes back.
 
 The core has zero runtime dependencies. The Anthropic wrapper is typed structurally, so `@anthropic-ai/sdk` is an optional peer.
 
@@ -58,7 +58,7 @@ In the browser or an edge runtime, import from `pii-gate/core`. It has everythin
   <img alt="Sequence diagram: your app calls pii-gate, which detects PII. If a blocked category is found it writes blocked: true to the audit log and throws PiiBlockedError, so nothing reaches the model. Otherwise it stores each value in the per-request vault as a placeholder like {{PERSON_1}}, sends the masked params to the LLM API, restores exact placeholders from the vault in the reply, writes counts and latency to the audit log, and returns the reply with real values." src="docs/diagrams/request-flow-light.png">
 </picture>
 
-An [interactive version](https://pii-gate-eight.vercel.app/diagrams/request-flow.html) links each participant to its source. The diagram is generated with [Archify](https://github.com/tt-a1i/archify) from [`docs/diagrams/request-flow.archify.json`](docs/diagrams/request-flow.archify.json). Archify is MIT-licensed; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+An [interactive version](https://pii-gate.vercel.app/diagrams/request-flow.html) links each participant to its source. The diagram is generated with [Archify](https://github.com/tt-a1i/archify) from [`docs/diagrams/request-flow.archify.json`](docs/diagrams/request-flow.archify.json). Archify is MIT-licensed; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 - **Detection** comes from regex detectors for SSN, phone, email, VIN (with check digit), credit card (Luhn), DOB (cue-gated), driver's license (cue-gated), street address and person name (cue-gated). US formats are detected anywhere in the text. International phone numbers (`Phone: +44 20 7946 0958`, `phone number: 55501234`) and day-first dates of birth (`DOB: 15/02/1988`) are detected only directly after a label. When matches overlap, the longest wins, and ties go to the higher confidence. Numbers labelled as policy, claim or account identifiers are not reported as phones or SSNs.
 - **Schema hints** handle values you already know from the database record, which are masked directly without detection: `schemaHints: { insured: { value: row.insured_name, category: "PERSON" } }`. They take priority over detector output, and their categories can be custom (`CLAIM_ID`, `MEMBER_ID`).

@@ -35,4 +35,4 @@ Flow: app → `mask()` (detect → typed placeholders like `{{PERSON_1}}`, origi
 - Tool inputs are restored with real values, so masking doesn't prevent exfiltration through tool calls, and placeholder-shaped text already in the input isn't escaped. See ADR 0002 (Proposed). Escaping exact tokens only narrows the risk; the per-tool restore policy is the real control. When implementing, don't escape vault-known tokens in replayed assistant turns. Don't change the default restore behaviour without updating the ADR.
 
 ## Roadmap ideas
-Done: Next.js demo (`demo/`, live at pii-gate-eight.vercel.app), latency benchmark (`npm run bench`). Next: implement ADR 0002 (per-tool restore policy, escape planted placeholders), optional NER detector adapter, Redis vault implementation.
+Done: Next.js demo (`demo/`, live at pii-gate.vercel.app), latency benchmark (`npm run bench`). Next: implement ADR 0002 (per-tool restore policy, escape planted placeholders), optional NER detector adapter, Redis vault implementation.
