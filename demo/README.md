@@ -16,7 +16,7 @@ npm install
 npm run dev          # builds the library in .. first, then http://localhost:3000
 ```
 
-Live mode turns on when `ANTHROPIC_API_KEY` is set. `DEMO_MODEL` overrides the model (default `claude-opus-5-5`; `claude-haiku-5-5` is cheaper). The page is prerendered, so set both before `npm run build`.
+Live mode turns on when `ANTHROPIC_API_KEY` is set. `DEMO_MODEL` overrides the model (default `claude-sonnet-5-5`; `claude-haiku-5-5` is cheaper, `claude-opus-5-5` is stronger). The page is prerendered, so set both before `npm run build`.
 
 ## Deploy (Vercel)
 
