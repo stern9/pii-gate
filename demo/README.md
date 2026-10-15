@@ -1,5 +1,7 @@
 # pii-gate demo
 
+Live at [pii-gate-eight.vercel.app](https://pii-gate-eight.vercel.app).
+
 A single page that runs a fictional insurance note through pii-gate and shows every step: what was detected, what the model received, what it replied, what the app gets back, and the audit row.
 
 ## How the data stays fake
