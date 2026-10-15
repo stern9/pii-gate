@@ -81,6 +81,11 @@ export type GateRun =
       /** The model's reply before restoration (placeholders intact). */
       raw: Block[];
       restored: Block[];
+      /**
+       * Each placeholder and the value it was swapped back for, so the page can
+       * chip them. Fictional sample values already visible in `restored`.
+       */
+      restoredValues: { token: string; category: string; value: string }[];
       warnings: UnmaskWarning[];
       audit: AuditRecord;
       stopReason: string | null;
@@ -128,6 +133,7 @@ export async function runGate(note: string, policy: Policy, model: string, creat
       sent: { system: sent?.system ?? "", user: sent?.messages[0]?.content ?? "" },
       raw: visible(raw?.content ?? []),
       restored: visible(message.content),
+      restoredValues: report.vault.entries().map(({ token, category, value }) => ({ token, category, value })),
       warnings: report.warnings,
       audit: records[0] as AuditRecord,
       stopReason: message.stop_reason ?? null,

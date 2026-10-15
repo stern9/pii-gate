@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { PiiBlockedError, mask, type Policy, type PolicyAction } from "pii-gate/core";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { Policy, PolicyAction } from "pii-gate/core";
 import { ArrowRight, Ban, Lock, Send, ShieldCheck, TriangleAlert } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -11,35 +11,18 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ACTIONS, runGate, type Block, type GateRun } from "@/lib/gate";
+import { preview } from "@/lib/preview";
 import { FAKE_DATA_SOURCES, SAMPLES } from "@/lib/samples";
 import { simulatedModel } from "@/lib/simulated-model";
 import { cn } from "@/lib/utils";
-import { TokenText, actionFor, categoryStyle } from "./highlight";
+import { PreviewText, TokenText, actionFor, categoryStyle, type RestoredValue } from "./highlight";
 
 type Mode = "simulated" | "live";
 const CUSTOM = "custom";
 const MAX_LENGTH = 4000;
-
-type Preview =
-  | { kind: "masked"; text: string; counts: Record<string, number> }
-  | { kind: "blocked"; text: string; categories: string[]; counts: Record<string, number> };
-
-/** Live preview of the masking step, run in the browser on every keystroke. */
-function preview(text: string, policy: Policy): Preview {
-  const all = mask(text);
-  const counts: Record<string, number> = {};
-  for (const f of all.findings) counts[f.category] = (counts[f.category] ?? 0) + 1;
-  try {
-    return { kind: "masked", text: mask(text, { policy }).masked, counts };
-  } catch (err) {
-    if (err instanceof PiiBlockedError) {
-      // Still show what masking would have produced, dimmed, so the block reads as a decision, not a crash.
-      const asMask = Object.fromEntries(Object.entries(policy).map(([c, a]) => [c, a === "block" ? "mask" : a]));
-      return { kind: "blocked", text: mask(text, { policy: asMask }).masked, categories: err.categories, counts };
-    }
-    throw err;
-  }
-}
+const CUSTOM_PLACEHOLDER = `Use made-up details only, for example:
+Insured: Alex Sample called from (312) 555-0199 about claim CLM-1001.
+Email alex.sample@example.com, DOB 01/02/1980.`;
 
 export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liveModel: string }) {
   const [sampleId, setSampleId] = useState<string>(SAMPLES[0]?.id ?? CUSTOM);
@@ -50,12 +33,20 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
   const [running, setRunning] = useState(false);
   const [run, setRun] = useState<GateRun | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
 
   const sample = SAMPLES.find((s) => s.id === sampleId);
   const isCustom = !sample;
   const liveAllowed = liveAvailable && !isCustom;
   const effectiveMode: Mode = liveAllowed ? mode : "simulated";
   const view = useMemo(() => preview(text, policy), [text, policy]);
+
+  // Bring the answer into view after Ask; jump instead of glide for reduced motion.
+  useEffect(() => {
+    if (!run && !requestError) return;
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    resultsRef.current?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+  }, [run, requestError]);
 
   function reset() {
     setRun(null);
@@ -112,42 +103,46 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
 
   return (
     <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-10 sm:px-6">
-      <header className="flex flex-col gap-2">
+      <header className="flex flex-col gap-3">
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <ShieldCheck className="size-4" aria-hidden /> pii-gate
         </div>
-        <h1 className="text-3xl font-semibold tracking-tight">See what an LLM sees when personal data is masked</h1>
-        <p className="max-w-3xl text-muted-foreground">
-          Type or pick a note, and see what pii-gate sends to the model instead. Ask the model, and the reply comes
-          back with the real values restored.
-        </p>
-        <details className="text-sm text-muted-foreground">
-          <summary className="cursor-pointer">All samples are fictional. Why this data is fake</summary>
-          <ul className="mt-2 grid gap-1 sm:grid-cols-2">
-            {FAKE_DATA_SOURCES.map((s) => (
-              <li key={s.kind}>
-                <span className="font-medium text-foreground">{s.kind}:</span> {s.why}
-              </li>
-            ))}
-          </ul>
-        </details>
+        <h1 className="text-3xl font-semibold tracking-tight text-balance">
+          Use an LLM on claim notes without sending it the SSNs.
+        </h1>
+        <div className="flex max-w-3xl flex-col gap-1 text-muted-foreground">
+          <p>
+            pii-gate swaps names, SSNs, VINs and card numbers for placeholders before the prompt leaves your process,
+            then puts the real values back in the reply. Try it on a note below.
+          </p>
+          <p className="text-sm">Most LLM tasks on this text (summarise, draft, route) don&apos;t need the real values.</p>
+        </div>
+        <Pipeline run={run} />
       </header>
 
-      <div className="flex flex-wrap gap-2" role="group" aria-label="Choose a note">
-        {SAMPLES.map((s) => (
-          <Button key={s.id} size="sm" variant={s.id === sampleId ? "default" : "outline"} onClick={() => choose(s.id)}>
-            {s.title}
+      <div className="flex flex-col gap-2">
+        <div className="flex flex-wrap gap-2" role="group" aria-label="Choose a note">
+          {SAMPLES.map((s) => (
+            <Button key={s.id} size="sm" variant={s.id === sampleId ? "default" : "outline"} onClick={() => choose(s.id)}>
+              {s.title}
+            </Button>
+          ))}
+          <Button size="sm" variant={isCustom ? "default" : "outline"} onClick={() => edit(isCustom ? text : "")}>
+            Write your own
           </Button>
-        ))}
-        <Button size="sm" variant={isCustom ? "default" : "outline"} onClick={() => edit(isCustom ? text : "")}>
-          Write your own
-        </Button>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          All samples are fictional.{" "}
+          <a href="#fake-data" className="underline underline-offset-2 hover:text-foreground">
+            Why this data is fake
+          </a>
+        </p>
       </div>
 
       <section className="grid items-stretch gap-4 lg:grid-cols-[1fr_auto_1fr]">
         <Card>
           <CardHeader>
-            <CardTitle>Your note</CardTitle>
+            <CardTitle>1. Your note</CardTitle>
             <CardDescription>{sample?.note ?? "Edit freely. Use made-up details."}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col gap-2">
@@ -155,6 +150,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
               aria-label="Note"
               value={text}
               maxLength={MAX_LENGTH}
+              placeholder={CUSTOM_PLACEHOLDER}
               onChange={(e) => edit(e.target.value)}
               className="min-h-72 flex-1 font-mono text-sm leading-7"
             />
@@ -173,28 +169,24 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
 
         <Card>
           <CardHeader>
-            <CardTitle>What the model sees</CardTitle>
+            <CardTitle>2. What the model sees</CardTitle>
             <CardDescription>Updates as you type. Choose what happens to each kind of detail.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col gap-4">
             {view.kind === "blocked" && (
-              <Alert variant="destructive">
-                <Ban aria-hidden />
-                <AlertTitle>Request stopped: nothing would be sent</AlertTitle>
-                <AlertDescription>
-                  This note contains {view.categories.join(", ")}, which your policy blocks. Block is for data that should
-                  never reach a prompt. Use Mask to send a placeholder instead.
-                </AlertDescription>
-              </Alert>
+              <p className="flex items-start gap-2 text-sm text-destructive">
+                <Ban className="mt-0.5 size-4 shrink-0" aria-hidden />
+                <span>
+                  Your policy blocks {view.blocked.join(", ")}, so this request would not be sent. Use Mask to send a
+                  placeholder instead.
+                </span>
+              </p>
             )}
             <div
-              className={cn(
-                "min-h-40 flex-1 rounded-lg border bg-muted/30 p-3",
-                view.kind === "blocked" && "opacity-40",
-              )}
+              className={cn("min-h-40 flex-1 rounded-lg border bg-muted/30 p-3", view.kind === "blocked" && "opacity-40")}
               aria-label={view.kind === "blocked" ? "Masked text that would have been sent (blocked)" : undefined}
             >
-              <TokenText text={view.text} />
+              <PreviewText segments={view.segments} />
             </div>
 
             {detected.length === 0 ? (
@@ -212,6 +204,14 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
                 ))}
               </ul>
             )}
+            {view.allowed.map((category) => (
+              <p key={category} className="flex items-start gap-2 text-xs text-amber-800 dark:text-amber-300">
+                <TriangleAlert className="mt-px size-3.5 shrink-0" aria-hidden />
+                <span>
+                  <code>{category}</code> will be sent in clear text and counted in the audit row.
+                </span>
+              </p>
+            ))}
             {detected.length > 0 && (
               <p className="text-xs text-muted-foreground">
                 <span className="font-medium text-foreground">Mask</span> sends a placeholder ·{" "}
@@ -219,6 +219,17 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
                 <span className="font-medium text-foreground">Allow</span> sends the real value, counted in the audit row
               </p>
             )}
+            <p className="text-xs text-muted-foreground">
+              Policy, claim and account numbers are left alone on purpose, even when they look like a phone number or
+              SSN.
+              {view.hasKept && (
+                <>
+                  {" "}
+                  <span className="underline decoration-dotted decoration-2 underline-offset-4">Dotted underline</span>{" "}
+                  marks one in this note.
+                </>
+              )}
+            </p>
           </CardContent>
         </Card>
       </section>
@@ -260,15 +271,87 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
             />
           </div>
           <Button className="self-start" size="lg" onClick={() => ask()} disabled={running || text.trim() === ""}>
-            <Send aria-hidden /> {running ? "Asking…" : "Ask the model"}
+            <Send aria-hidden />{" "}
+            {running ? "Asking…" : view.kind === "blocked" ? "Ask the model (will be blocked)" : "Ask the model"}
           </Button>
         </CardContent>
       </Card>
 
-      {requestError && <LiveUnavailable reason={requestError} onSimulate={useSimulated} />}
+      <div ref={resultsRef} className="flex scroll-mt-4 flex-col gap-4" aria-live="polite">
+        {requestError && <LiveUnavailable reason={requestError} onSimulate={useSimulated} />}
+        {run && <Results run={run} onSimulate={useSimulated} />}
+      </div>
 
-      {run && <Results run={run} onSimulate={useSimulated} />}
+      <footer id="fake-data" className="mt-6 scroll-mt-4 border-t pt-6 text-sm text-muted-foreground">
+        <h2 className="mb-2 font-medium text-foreground">Why this data is fake</h2>
+        <ul className="grid gap-1 sm:grid-cols-2">
+          {FAKE_DATA_SOURCES.map((s) => (
+            <li key={s.kind}>
+              <span className="font-medium text-foreground">{s.kind}:</span> {s.why}
+            </li>
+          ))}
+        </ul>
+      </footer>
     </main>
+  );
+}
+
+type StepState = "on" | "off" | "skipped";
+
+const STEPS = [
+  { name: "Detect", body: "regex detectors + your hints" },
+  { name: "Mask", body: "{{PERSON_1}} goes out, the name stays in a per-request vault" },
+  { name: "Model", body: "sees placeholders only" },
+  { name: "Restore", body: "real values back in text and tool-call args" },
+  { name: "Audit", body: "counts, never values" },
+] as const;
+
+/** Which steps a run reached: a block (or a failed model call) skips 3–4 but still writes the audit row. */
+function stepStates(run: GateRun | null): StepState[] {
+  if (!run) return ["on", "on", "off", "off", "off"];
+  if (run.ok) return ["on", "on", "on", "on", "on"];
+  return ["on", "on", "skipped", "skipped", run.audit ? "on" : "skipped"];
+}
+
+function Pipeline({ run }: { run: GateRun | null }) {
+  const states = stepStates(run);
+  return (
+    <ol className="flex flex-wrap gap-x-1 gap-y-2 pt-1" aria-label="How pii-gate handles a request">
+      {STEPS.map((step, i) => {
+        const state = states[i] as StepState;
+        return (
+          <li key={step.name} className="flex flex-[1_1_10rem] items-center gap-1">
+            <div
+              className={cn(
+                "flex h-full flex-1 items-start gap-2 rounded-lg border px-2.5 py-1.5 transition-colors",
+                state === "on" ? "border-primary/40 bg-primary/5" : "border-dashed text-muted-foreground",
+                state === "skipped" && "opacity-50",
+              )}
+            >
+              <span
+                className={cn(
+                  "mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
+                  state === "on" ? "bg-primary text-primary-foreground" : "border",
+                )}
+                aria-hidden
+              >
+                {i + 1}
+              </span>
+              <span className="flex flex-col">
+                <span className={cn("text-sm font-medium", state === "skipped" && "line-through")}>
+                  {step.name}
+                  <span className="sr-only">
+                    {state === "on" ? " (done)" : state === "skipped" ? " (skipped)" : " (after you ask)"}
+                  </span>
+                </span>
+                <span className="text-xs leading-4 text-muted-foreground">{step.body}</span>
+              </span>
+            </div>
+            {i < STEPS.length - 1 && <ArrowRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -375,119 +458,149 @@ function LiveUnavailable({ reason, onSimulate }: { reason: string; onSimulate: (
   );
 }
 
+function ResultCard({ description, children }: { description: string; children: React.ReactNode }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>3. What came back</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">{children}</CardContent>
+    </Card>
+  );
+}
+
 function Results({ run, onSimulate }: { run: GateRun; onSimulate: () => void }) {
   if (!run.ok && run.error.upstream) {
     return (
-      <section className="flex flex-col gap-4">
+      <ResultCard description="The model call failed after masking.">
         <LiveUnavailable
           reason="Claude couldn't be reached. The note was masked before it was sent, so no personal details left the server."
           onSimulate={onSimulate}
         />
         {run.audit && <Audit audit={run.audit} />}
-      </section>
+      </ResultCard>
     );
   }
   if (!run.ok) {
+    const blocked = run.error.blockedCategories;
     return (
-      <section className="flex flex-col gap-4">
+      <ResultCard description="The request stopped inside your process. Your app gets an error and an audit row.">
         <Alert variant="destructive">
           <Ban aria-hidden />
-          <AlertTitle>
-            {run.error.name === "PiiBlockedError" ? "Blocked before the model was called" : `Rejected: ${run.error.name}`}
-          </AlertTitle>
+          <AlertTitle>{blocked ? "Blocked: nothing reached the model" : `Rejected: ${run.error.name}`}</AlertTitle>
           <AlertDescription>
-            {run.error.blockedCategories
-              ? `Nothing was sent. The error and the audit row name the blocked category (${run.error.blockedCategories.join(", ")}), never the value.`
+            {blocked
+              ? `Your policy blocks ${blocked.join(", ")}, so pii-gate threw ${run.error.name} before calling the model. The error names the category, never the value.`
               : "Nothing was sent to the model."}
           </AlertDescription>
         </Alert>
-        {run.audit && <Audit audit={run.audit} />}
-      </section>
+        {run.audit && (
+          <section className="flex flex-col gap-2">
+            <h3 className="text-sm font-medium">Audit row</h3>
+            <Audit audit={run.audit} intro="A block still writes an audit row, so you can see what was stopped and why. Counts only, never the values." />
+          </section>
+        )}
+      </ResultCard>
     );
   }
 
   return (
-    <Card>
-      <CardContent className="flex flex-col gap-4">
-        {run.stopReason === "refusal" && (
-          <Alert variant="destructive">
-            <TriangleAlert aria-hidden />
-            <AlertTitle>The model declined this request</AlertTitle>
-            <AlertDescription>Try another sample or the simulated model.</AlertDescription>
-          </Alert>
-        )}
-        {run.warnings.length > 0 && (
-          <Alert>
-            <TriangleAlert aria-hidden />
-            <AlertTitle>A mistyped placeholder was left as written</AlertTitle>
-            <AlertDescription>
-              {run.warnings.map((w) => (
-                <p key={`${w.path ?? ""}${w.index}`}>
-                  The model wrote <code>{w.found}</code>, which looks like <code>{w.suggestion ?? "an unknown token"}</code>.
-                  pii-gate flags it instead of guessing, because a wrong guess could put one customer&apos;s data in a
-                  sentence about another.
-                </p>
-              ))}
-            </AlertDescription>
-          </Alert>
-        )}
-        <Tabs defaultValue="restored">
-          <TabsList>
-            <TabsTrigger value="reply">Model&apos;s reply</TabsTrigger>
-            <TabsTrigger value="restored">What your app gets</TabsTrigger>
-            <TabsTrigger value="audit">Audit row</TabsTrigger>
-          </TabsList>
-          <TabsContent value="reply" className="pt-3">
-            <p className="mb-3 text-sm text-muted-foreground">Exactly what came back from the model: placeholders only.</p>
-            <Blocks blocks={run.raw} />
-          </TabsContent>
-          <TabsContent value="restored" className="pt-3">
-            <p className="mb-3 text-sm text-muted-foreground">
-              Placeholders swapped back for the real values, in the text and in the tool call the model made.
-            </p>
-            <Blocks blocks={run.restored} />
-          </TabsContent>
-          <TabsContent value="audit" className="pt-3">
-            <Audit audit={run.audit} />
-          </TabsContent>
-        </Tabs>
-      </CardContent>
-    </Card>
+    <ResultCard description="The model's reply, the same reply with real values restored, and the audit row.">
+      {run.stopReason === "refusal" && (
+        <Alert variant="destructive">
+          <TriangleAlert aria-hidden />
+          <AlertTitle>The model declined this request</AlertTitle>
+          <AlertDescription>Try another sample or the simulated model.</AlertDescription>
+        </Alert>
+      )}
+      {run.warnings.length > 0 && (
+        <Alert>
+          <TriangleAlert aria-hidden />
+          <AlertTitle>A mistyped placeholder was left as written</AlertTitle>
+          <AlertDescription>
+            {run.warnings.map((w) => (
+              <p key={`${w.path ?? ""}${w.index}`}>
+                The model wrote <code>{w.found}</code>, which looks like <code>{w.suggestion ?? "an unknown token"}</code>.
+                pii-gate flags it instead of guessing, because a wrong guess could put one customer&apos;s data in a
+                sentence about another.
+              </p>
+            ))}
+          </AlertDescription>
+        </Alert>
+      )}
+      <Tabs defaultValue="restored">
+        <TabsList className="max-w-full flex-wrap group-data-horizontal/tabs:h-auto">
+          <TabsTrigger value="reply">Model&apos;s reply (placeholders)</TabsTrigger>
+          <TabsTrigger value="restored">Restored (what your app gets)</TabsTrigger>
+          <TabsTrigger value="audit">Audit row</TabsTrigger>
+        </TabsList>
+        <TabsContent value="reply" className="pt-3">
+          <p className="mb-3 text-sm text-muted-foreground">Exactly what came back from the model: placeholders only.</p>
+          <Blocks blocks={run.raw} />
+        </TabsContent>
+        <TabsContent value="restored" className="pt-3">
+          <p className="mb-3 text-sm text-muted-foreground">
+            Placeholders swapped back for the real values, in the text and in the tool call&apos;s arguments. Each
+            coloured value was restored; hover it to see the placeholder it replaced.
+          </p>
+          <Blocks blocks={run.restored} values={run.restoredValues ?? []} />
+        </TabsContent>
+        <TabsContent value="audit" className="pt-3">
+          <Audit audit={run.audit} />
+        </TabsContent>
+      </Tabs>
+    </ResultCard>
   );
 }
 
-function Blocks({ blocks }: { blocks: readonly Block[] }) {
+function Blocks({ blocks, values }: { blocks: readonly Block[]; values?: readonly RestoredValue[] }) {
   return (
     <div className="flex flex-col gap-4">
       {blocks.map((b, i) =>
         b.type === "text" ? (
-          <TokenText key={i} text={String(b.text ?? "")} />
+          <TokenText key={i} text={String(b.text ?? "")} values={values} />
         ) : (
-          <ToolCall key={i} block={b} />
+          <ToolCall key={i} block={b} values={values} />
         ),
       )}
     </div>
   );
 }
 
-function ToolCall({ block }: { block: Block }) {
+function ToolCall({ block, values }: { block: Block; values?: readonly RestoredValue[] }) {
   const input = (block.input ?? {}) as Record<string, unknown>;
   const { summary, ...rest } = input;
+  const hasSummary = typeof summary === "string";
   return (
-    <div className="flex flex-col gap-3">
-      {typeof summary === "string" && <TokenText text={summary} />}
-      <div className="rounded-lg border bg-muted/30 p-3">
-        <div className="mb-1 text-xs font-medium text-muted-foreground">Tool call: {String(block.name)}</div>
-        <TokenText text={JSON.stringify(typeof summary === "string" ? rest : input, null, 2)} className="text-xs leading-6" />
+    <div className="flex flex-col gap-3 rounded-lg border bg-muted/30 p-3">
+      <div className="text-xs font-medium text-muted-foreground">Tool call: {String(block.name)}</div>
+      {hasSummary && (
+        <div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Tool input: summary</div>
+          <TokenText text={summary} values={values} />
+        </div>
+      )}
+      <div>
+        <div className="mb-1 text-xs font-medium text-muted-foreground">
+          {hasSummary ? "Other tool inputs" : "Tool input"}
+        </div>
+        <TokenText text={JSON.stringify(hasSummary ? rest : input, null, 2)} values={values} className="text-xs leading-6" />
       </div>
     </div>
   );
 }
 
-function Audit({ audit }: { audit: object }) {
+function Audit({
+  audit,
+  intro = "One row per request. Counts and totals only, never the values.",
+}: {
+  audit: object;
+  intro?: string;
+}) {
   return (
     <div className="flex flex-col gap-2">
-      <p className="text-sm text-muted-foreground">One row per request. Counts and totals only, never the values.</p>
+      <p className="text-sm text-muted-foreground">{intro}</p>
       <pre className="overflow-x-auto rounded-lg border bg-muted/30 p-4 font-mono text-xs leading-6">
         {JSON.stringify(audit, null, 2)}
       </pre>

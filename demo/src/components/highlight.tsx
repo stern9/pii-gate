@@ -1,4 +1,5 @@
 import type { Policy, PolicyAction } from "pii-gate/core";
+import type { Segment } from "@/lib/preview";
 import { cn } from "@/lib/utils";
 
 const CATEGORY_STYLE: Record<string, string> = {
@@ -23,16 +24,95 @@ export function actionFor(category: string, policy: Policy): PolicyAction {
 
 const TOKEN = /(\{\{[A-Z][A-Z0-9_]*_\d+\}\})/g;
 
-/** Text with `{{CATEGORY_n}}` placeholders shown as coloured chips. */
-export function TokenText({ text, className }: { text: string; className?: string }) {
+export interface RestoredValue {
+  token: string;
+  category: string;
+  value: string;
+}
+
+/** A value in its category colour: a placeholder, or a real value pii-gate put back. */
+export function Chip({ category, title, children }: { category: string; title?: string; children: React.ReactNode }) {
+  return (
+    <span title={title} className={cn("rounded px-1 font-semibold", categoryStyle(category))}>
+      {children}
+    </span>
+  );
+}
+
+/** Splits plain text on restored values (longest first) and chips each occurrence. */
+function withValues(text: string, values: readonly RestoredValue[], key: string): React.ReactNode[] {
+  const sorted = values.filter((v) => v.value.length > 1).sort((a, b) => b.value.length - a.value.length);
+  if (sorted.length === 0) return [text];
+  const re = new RegExp(`(${sorted.map((v) => v.value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`);
+  return text.split(re).map((part, i) => {
+    const v = i % 2 === 1 ? sorted.find((x) => x.value === part) : undefined;
+    return v ? (
+      <Chip key={`${key}-${i}`} category={v.category} title={`Restored from ${v.token}`}>
+        {part}
+      </Chip>
+    ) : (
+      part
+    );
+  });
+}
+
+/**
+ * Text with `{{CATEGORY_n}}` placeholders shown as coloured chips. With
+ * `values`, the restored originals get the same chips, so placeholder-in /
+ * value-out lines up visually.
+ */
+export function TokenText({
+  text,
+  values = [],
+  className,
+}: {
+  text: string;
+  values?: readonly RestoredValue[];
+  className?: string;
+}) {
   return (
     <pre className={cn("whitespace-pre-wrap break-words font-mono text-sm leading-7", className)}>
-      {text.split(TOKEN).map((part, i) => {
+      {text.split(TOKEN).flatMap((part, i) => {
         const m = /^\{\{([A-Z][A-Z0-9_]*)_\d+\}\}$/.exec(part);
-        if (!m) return part;
-        return (
-          <span key={i} className={cn("rounded px-1 font-semibold", categoryStyle(m[1] as string))}>
+        if (!m) return withValues(part, values, String(i));
+        return [
+          <Chip key={i} category={m[1] as string}>
             {part}
+          </Chip>,
+        ];
+      })}
+    </pre>
+  );
+}
+
+/** The masked preview: placeholders, values sent as-is (Allow), and identifiers kept on purpose. */
+export function PreviewText({ segments }: { segments: readonly Segment[] }) {
+  return (
+    <pre className="whitespace-pre-wrap break-words font-mono text-sm leading-7">
+      {segments.map((s, i) => {
+        if (s.kind === "text") return s.text;
+        if (s.kind === "token") return <Chip key={i} category={s.category}>{s.text}</Chip>;
+        if (s.kind === "allow")
+          return (
+            <span
+              key={i}
+              title={`${s.category}: sent as-is`}
+              className="rounded border border-dashed border-amber-600 px-1 text-amber-900 dark:border-amber-400 dark:text-amber-200"
+            >
+              {s.text}
+              <span className="ml-1 rounded-sm bg-amber-100 px-1 font-sans text-[0.65rem] font-medium uppercase tracking-wide text-amber-900 dark:bg-amber-900/60 dark:text-amber-100">
+                sent as-is
+              </span>
+            </span>
+          );
+        return (
+          <span
+            key={i}
+            title="Kept: labelled identifier"
+            className="underline decoration-muted-foreground decoration-dotted decoration-2 underline-offset-4"
+          >
+            {s.text}
+            <span className="sr-only"> (kept: labelled identifier)</span>
           </span>
         );
       })}
