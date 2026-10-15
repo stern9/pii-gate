@@ -22,7 +22,7 @@ const MAX_LENGTH = 4000;
 
 type Preview =
   | { kind: "masked"; text: string; counts: Record<string, number> }
-  | { kind: "blocked"; categories: string[]; counts: Record<string, number> };
+  | { kind: "blocked"; text: string; categories: string[]; counts: Record<string, number> };
 
 /** Live preview of the masking step, run in the browser on every keystroke. */
 function preview(text: string, policy: Policy): Preview {
@@ -32,7 +32,11 @@ function preview(text: string, policy: Policy): Preview {
   try {
     return { kind: "masked", text: mask(text, { policy }).masked, counts };
   } catch (err) {
-    if (err instanceof PiiBlockedError) return { kind: "blocked", categories: err.categories, counts };
+    if (err instanceof PiiBlockedError) {
+      // Still show what masking would have produced, dimmed, so the block reads as a decision, not a crash.
+      const asMask = Object.fromEntries(Object.entries(policy).map(([c, a]) => [c, a === "block" ? "mask" : a]));
+      return { kind: "blocked", text: mask(text, { policy: asMask }).masked, categories: err.categories, counts };
+    }
     throw err;
   }
 }
@@ -173,19 +177,25 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
             <CardDescription>Updates as you type. Choose what happens to each kind of detail.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-1 flex-col gap-4">
-            {view.kind === "masked" ? (
-              <div className="min-h-40 flex-1 rounded-lg border bg-muted/30 p-3">
-                <TokenText text={view.text} />
-              </div>
-            ) : (
-              <Alert variant="destructive" className="flex-1">
+            {view.kind === "blocked" && (
+              <Alert variant="destructive">
                 <Ban aria-hidden />
-                <AlertTitle>Nothing would be sent</AlertTitle>
+                <AlertTitle>Request stopped: nothing would be sent</AlertTitle>
                 <AlertDescription>
-                  The policy blocks {view.categories.join(", ")}, so the whole request stops before the model is called.
+                  This note contains {view.categories.join(", ")}, which your policy blocks. Block is for data that should
+                  never reach a prompt. Use Mask to send a placeholder instead.
                 </AlertDescription>
               </Alert>
             )}
+            <div
+              className={cn(
+                "min-h-40 flex-1 rounded-lg border bg-muted/30 p-3",
+                view.kind === "blocked" && "opacity-40",
+              )}
+              aria-label={view.kind === "blocked" ? "Masked text that would have been sent (blocked)" : undefined}
+            >
+              <TokenText text={view.text} />
+            </div>
 
             {detected.length === 0 ? (
               <p className="text-sm text-muted-foreground">No personal details detected.</p>
@@ -201,6 +211,13 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
                   </li>
                 ))}
               </ul>
+            )}
+            {detected.length > 0 && (
+              <p className="text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">Mask</span> sends a placeholder ·{" "}
+                <span className="font-medium text-foreground">Block</span> stops the whole request ·{" "}
+                <span className="font-medium text-foreground">Allow</span> sends the real value, counted in the audit row
+              </p>
             )}
           </CardContent>
         </Card>
