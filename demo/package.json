@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build:lib": "npm --prefix .. ci && npm --prefix .. run build",
+    "build:lib": "npm --prefix .. ci --include=dev && npm --prefix .. run build",
     "predev": "npm --prefix .. run build",
     "prebuild": "npm run build:lib",
     "dev": "next dev",
