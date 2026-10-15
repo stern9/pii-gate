@@ -24,3 +24,11 @@ export class UnsupportedContentError extends Error {
     super(`pii-gate cannot inspect ${what}; refusing to forward it unmasked. Set unsupportedContent: "passthrough" to override.`);
   }
 }
+
+/**
+ * An internal consistency check failed (for example, request params changed
+ * between the wrapper's two traversals). Nothing was sent. Carries counts only.
+ */
+export class PiiGateInvariantError extends Error {
+  override readonly name = "PiiGateInvariantError";
+}

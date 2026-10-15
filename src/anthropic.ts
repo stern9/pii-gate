@@ -1,6 +1,7 @@
 import type { AuditLogger, AuditRecord } from "./audit.js";
-import { PiiBlockedError, UnsupportedContentError } from "./errors.js";
-import { countByCategory, maskAll, type MaskOptions } from "./mask.js";
+import { PiiBlockedError, PiiGateInvariantError, UnsupportedContentError } from "./errors.js";
+import { countByCategory, maskTexts, type MaskInput, type MaskOptions } from "./mask.js";
+import { LITERAL_CATEGORY, addCount, assertValidCategory, nullRecord, type Category } from "./types.js";
 import { countTokens, unmask, unmaskDeep, type UnmaskWarning } from "./unmask.js";
 import { InMemoryVault, type Vault } from "./vault.js";
 
@@ -36,7 +37,25 @@ export interface MessagesClientLike<P extends CreateParamsLike, R extends Messag
   };
 }
 
-export interface WrapAnthropicOptions extends Omit<MaskOptions, "vault"> {
+/** `(toolName, path, category) => restore?`; `path` is a JSON Pointer inside the tool's `input`, e.g. "/body". */
+export type ToolRestorePredicate = (tool: string, path: string, category: Category) => boolean;
+
+/**
+ * Which placeholders are restored into `tool_use.input` (ADR 0002).
+ * - `true` (default): restore everything, as before.
+ * - `false`: restore nothing; handlers resolve tokens through the report's vault.
+ * - record: per tool name, `true`/`false` or the list of categories to restore.
+ *   The `"*"` key is the default for unlisted tools (without it they are restored),
+ *   so `{ "*": false, lookup_policy: ["PERSON"] }` is deny-by-default.
+ * - predicate: full control per tool, path and category.
+ * Text blocks are not affected.
+ */
+export type RestoreToolInputs =
+  | boolean
+  | Readonly<Record<string, boolean | readonly Category[]>>
+  | ToolRestorePredicate;
+
+export interface WrapAnthropicOptions extends Omit<MaskOptions, "vault" | "keepIssuedPlaceholders"> {
   audit?: AuditLogger;
   /** Default: crypto.randomUUID(). */
   requestId?: () => string;
@@ -51,8 +70,22 @@ export interface WrapAnthropicOptions extends Omit<MaskOptions, "vault"> {
    * unmasked block.
    */
   unsupportedContent?: "throw" | "passthrough";
-  /** Called with unmask warnings (tokens only, never values). */
+  /** Called with unmask warnings, including `withheld` ones (tokens and paths only, never values). */
   onUnmaskWarnings?: (warnings: UnmaskWarning[], requestId: string) => void;
+  /**
+   * Restore policy for `tool_use.input`. Default `true` (restore everything) in
+   * v0.x. Tokens held back stay as placeholders and are reported as `withheld`
+   * warnings. Handlers with external side effects (email, HTTP, file or queue
+   * writes) should receive placeholders and resolve them on purpose.
+   */
+  restoreToolInputs?: RestoreToolInputs;
+  /**
+   * Called when the audit write fails on a request that is already failing
+   * (block, unsupported content, upstream error). The original error is still
+   * the one thrown. On a successful request an audit failure is thrown instead,
+   * and this is not called. Exceptions from the callback itself are ignored.
+   */
+  onAuditError?: (error: unknown, requestId: string) => void;
 }
 
 export interface GateReport {
@@ -61,6 +94,8 @@ export interface GateReport {
   warnings: UnmaskWarning[];
   categoryCounts: Record<string, number>;
   responseReferencedTokens: number;
+  /** Same as the audit field: tool name -> category -> tokens restored into its input. Empty without tool calls. */
+  toolRestoredTokens: Record<string, Record<string, number>>;
 }
 
 export interface WrappedAnthropic<P extends CreateParamsLike, R extends MessageLike> {
@@ -72,7 +107,8 @@ export interface WrappedAnthropic<P extends CreateParamsLike, R extends MessageL
 }
 
 type Rec = Record<string, unknown>;
-type StringMapper = (s: string) => string;
+/** `assistant` is true for strings from replayed assistant turns. */
+type StringMapper = (s: string, assistant: boolean) => string;
 
 /** Blocks that carry no user-supplied free text, or whose signature forbids edits. */
 const PASSTHROUGH_TYPES = new Set(["thinking", "redacted_thinking"]);
@@ -81,22 +117,26 @@ function isRecord(v: unknown): v is Rec {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function mapDeepStrings(value: unknown, fn: StringMapper): unknown {
+function mapDeepStrings(value: unknown, fn: (s: string) => string): unknown {
   if (typeof value === "string") return fn(value);
   if (Array.isArray(value)) return value.map((v) => mapDeepStrings(v, fn));
   if (isRecord(value)) {
-    const out: Rec = {};
-    for (const [k, v] of Object.entries(value)) out[k] = mapDeepStrings(v, fn);
-    return out;
+    // fromEntries defines own properties, so a JSON key "__proto__" stays a key instead of setting the prototype.
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, mapDeepStrings(v, fn)]));
   }
   return value;
 }
 
 class BlockMapper {
+  private readonly fn: (s: string) => string;
+
   constructor(
-    private readonly fn: StringMapper,
+    fn: StringMapper,
     private readonly unsupported: "throw" | "passthrough",
-  ) {}
+    assistant: boolean,
+  ) {
+    this.fn = (s) => fn(s, assistant);
+  }
 
   content(content: string | readonly unknown[]): string | unknown[] {
     return typeof content === "string" ? this.fn(content) : content.map((b) => this.block(b));
@@ -143,29 +183,93 @@ class BlockMapper {
   }
 }
 
-function mapParams<P extends CreateParamsLike>(params: P, mapper: BlockMapper): P {
-  const messages = params.messages.map((m) => ({ ...m, content: mapper.content(m.content) }));
+function mapParams<P extends CreateParamsLike>(params: P, fn: StringMapper, unsupported: "throw" | "passthrough"): P {
+  const messages = params.messages.map((m) => ({
+    ...m,
+    content: new BlockMapper(fn, unsupported, m.role === "assistant").content(m.content),
+  }));
   const out: Rec = { ...(params as object), messages };
-  if (params.system !== undefined) out["system"] = mapper.content(params.system);
+  if (params.system !== undefined) out["system"] = new BlockMapper(fn, unsupported, false).content(params.system);
   // Only string leaves inside content changed; the object shape is P's.
   return out as unknown as P;
 }
 
 /** Every maskable string in `params`, in the same order `mapParams` visits them. */
-function collectStrings(params: CreateParamsLike, unsupported: "throw" | "passthrough"): string[] {
-  const texts: string[] = [];
-  mapParams(params, new BlockMapper((s) => (texts.push(s), s), unsupported));
-  return texts;
+function collectStrings(params: CreateParamsLike, unsupported: "throw" | "passthrough"): MaskInput[] {
+  const inputs: MaskInput[] = [];
+  // Replayed assistant turns may hold tokens the (conversation) vault issued earlier: keep those (ADR 0002).
+  mapParams(params, (text, assistant) => (inputs.push({ text, keepIssuedPlaceholders: assistant }), text), unsupported);
+  return inputs;
+}
+
+/** Thrown when the two traversals of `params` disagree. Carries counts only. */
+function traversalMismatch(detail: string): PiiGateInvariantError {
+  return new PiiGateInvariantError(`pii-gate internal invariant violated: params changed between traversals (${detail}); refusing to send.`);
 }
 
 function maskParams<P extends CreateParamsLike>(params: P, options: WrapAnthropicOptions, vault: Vault) {
   const unsupported = options.unsupportedContent ?? "throw";
-  const texts = collectStrings(params, unsupported);
-  const result = maskAll(texts, { ...options, vault });
+  const inputs = collectStrings(params, unsupported);
+  const result = maskTexts(inputs, { ...options, vault });
   let i = 0;
-  const masked = mapParams(params, new BlockMapper(() => result.masked[i++] ?? "", unsupported));
+  const masked = mapParams(
+    params,
+    () => {
+      const next = result.masked[i];
+      if (next === undefined) throw traversalMismatch(`more than ${result.masked.length} strings on the second pass`);
+      i++;
+      return next;
+    },
+    unsupported,
+  );
+  if (i !== result.masked.length) throw traversalMismatch(`${i} of ${result.masked.length} strings on the second pass`);
   return { masked, categoryCounts: countByCategory(result.findings.flat()) };
 }
+
+/**
+ * Validates `restoreToolInputs` once, at wrap time, and turns it into a
+ * predicate. The record form is copied into a Map, so later mutation of the
+ * caller's object and prototype keys (`__proto__`, `constructor`) have no effect.
+ * Errors name the option and the tool key (configuration, not PII), never values.
+ */
+function restorePredicate(policy: unknown): ToolRestorePredicate {
+  if (policy === undefined || policy === true) return () => true;
+  if (policy === false) return () => false;
+  if (typeof policy === "function") {
+    const fn = policy as ToolRestorePredicate;
+    return (tool, path, category) => fn(tool, path, category) === true;
+  }
+  if (typeof policy !== "object" || policy === null || Array.isArray(policy)) {
+    throw new TypeError("Invalid restoreToolInputs: expected a boolean, a record of per-tool rules, or a function.");
+  }
+  const rules = new Map<string, boolean | ReadonlySet<string>>();
+  for (const [tool, rule] of Object.entries(policy)) {
+    if (typeof rule === "boolean") {
+      rules.set(tool, rule);
+    } else if (Array.isArray(rule)) {
+      const categories = new Set<string>();
+      for (const category of rule as unknown[]) {
+        if (typeof category !== "string") {
+          throw new TypeError(`Invalid restoreToolInputs rule for tool "${tool}": categories must be strings.`);
+        }
+        assertValidCategory(category);
+        categories.add(category);
+      }
+      rules.set(tool, categories);
+    } else {
+      throw new TypeError(
+        `Invalid restoreToolInputs rule for tool "${tool}": expected true, false or an array of categories.`,
+      );
+    }
+  }
+  return (tool, _path, category) => {
+    const rule = rules.get(tool) ?? rules.get("*") ?? true;
+    return typeof rule === "boolean" ? rule : rule.has(category);
+  };
+}
+
+/** Key used for a tool_use block whose `name` is missing or empty. */
+const UNNAMED_TOOL = "(unnamed)";
 
 /** The declared type says R, but a misconfigured call (e.g. stream) can still return a Stream at runtime. */
 function assertMessage(value: unknown): asserts value is MessageLike {
@@ -174,8 +278,10 @@ function assertMessage(value: unknown): asserts value is MessageLike {
   }
 }
 
-function unmaskMessage<R extends MessageLike>(message: R, vault: Vault) {
+function unmaskMessage<R extends MessageLike>(message: R, vault: Vault, restore: ToolRestorePredicate) {
   const warnings: UnmaskWarning[] = [];
+  // Tool names come from model output: null-prototype maps so "__proto__" etc. stay ordinary keys.
+  const toolRestored = nullRecord<Record<string, number>>();
   let referenced = 0;
   const content = message.content.map((raw, index) => {
     if (!isRecord(raw)) return raw;
@@ -186,15 +292,43 @@ function unmaskMessage<R extends MessageLike>(message: R, vault: Vault) {
       return { ...raw, text: r.text };
     }
     if (raw["type"] === "tool_use" && isRecord(raw["input"])) {
+      const name = raw["name"];
+      const tool = typeof name === "string" && name !== "" ? name : UNNAMED_TOOL;
       mapDeepStrings(raw["input"], (s) => ((referenced += countTokens(s)), s));
-      const r = unmaskDeep(raw["input"], vault);
+      const r = unmaskDeep(raw["input"], vault, {
+        shouldRestore: (_token, category, path) => restore(tool, path, category),
+      });
       warnings.push(...r.warnings.map((w) => ({ ...w, path: `/content/${index}/input${w.path ?? ""}` })));
+      const counts = toolRestored[tool] ?? nullRecord<number>();
+      toolRestored[tool] = counts;
+      for (const [category, n] of Object.entries(r.restoredByCategory)) {
+        if (category !== LITERAL_CATEGORY) addCount(counts, category, n);
+      }
       return { ...raw, input: r.value };
     }
     return raw;
   });
   // Same object with only string leaves of content replaced.
-  return { message: { ...message, content } as R, warnings, referenced };
+  return { message: { ...message, content } as R, warnings, referenced, toolRestored };
+}
+
+const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+
+/**
+ * A class-level identifier for an error, never its message. SDK error classes
+ * (e.g. Anthropic's `RateLimitError`) do not set `name`, so fall back to the
+ * constructor name.
+ */
+function errorName(err: unknown): string {
+  if (!(err instanceof Error)) return "UnknownError";
+  const name: unknown = err.name;
+  if (typeof name === "string" && name !== "Error" && IDENTIFIER.test(name)) return name;
+  const ctor: unknown = (err as { constructor?: unknown }).constructor;
+  const ctorName: unknown = typeof ctor === "function" ? ctor.name : undefined;
+  if (typeof ctorName === "string" && ctorName !== "Error" && ctorName !== "Object" && IDENTIFIER.test(ctorName)) {
+    return ctorName;
+  }
+  return "Error";
 }
 
 function baseRecord(requestId: string, model: string, started: number): AuditRecord {
@@ -221,6 +355,7 @@ export function wrapAnthropic<P extends CreateParamsLike = CreateParamsLike, R e
   client: MessagesClientLike<P, R>,
   options: WrapAnthropicOptions = {},
 ): WrappedAnthropic<P, R> {
+  const restore = restorePredicate(options.restoreToolInputs);
   async function createWithReport(params: P): Promise<{ message: R; report: GateReport }> {
     const requestId = options.requestId?.() ?? globalThis.crypto.randomUUID();
     const started = Date.now();
@@ -230,8 +365,14 @@ export function wrapAnthropic<P extends CreateParamsLike = CreateParamsLike, R e
     };
     // On a failed request the caller's error is the one that matters; a failing
     // audit sink must not replace it (and wrapping would break `instanceof` checks).
-    const finishAfterError = (extra: Partial<AuditRecord>): Promise<void> => finish(extra).catch(() => undefined);
-    const errorName = (err: unknown): string => (err instanceof Error ? err.name : "UnknownError");
+    const finishAfterError = (extra: Partial<AuditRecord>): Promise<void> =>
+      finish(extra).catch((auditErr: unknown) => {
+        try {
+          options.onAuditError?.(auditErr, requestId);
+        } catch {
+          // The caller's original error still wins.
+        }
+      });
 
     let vault: Vault;
     let masked: P;
@@ -257,12 +398,32 @@ export function wrapAnthropic<P extends CreateParamsLike = CreateParamsLike, R e
       throw err;
     }
 
-    const { message, warnings, referenced } = unmaskMessage(response, vault);
-    if (warnings.length > 0) options.onUnmaskWarnings?.(warnings, requestId);
-    await finish({ responseReferencedTokens: referenced, unmaskWarnings: warnings.length });
+    let unmasked: ReturnType<typeof unmaskMessage<R>>;
+    try {
+      unmasked = unmaskMessage(response, vault, restore);
+      if (unmasked.warnings.length > 0) options.onUnmaskWarnings?.(unmasked.warnings, requestId);
+    } catch (err) {
+      // A throwing restore predicate or callback still leaves exactly one audit row.
+      await finishAfterError({ error: errorName(err) });
+      throw err;
+    }
+    const { message, warnings, referenced, toolRestored } = unmasked;
+    const hasTools = Object.keys(toolRestored).length > 0;
+    await finish({
+      responseReferencedTokens: referenced,
+      unmaskWarnings: warnings.filter((w) => w.kind !== "withheld").length,
+      ...(hasTools ? { toolRestoredTokens: toolRestored } : {}),
+    });
     return {
       message,
-      report: { requestId, vault, warnings, categoryCounts: record.categoryCounts, responseReferencedTokens: referenced },
+      report: {
+        requestId,
+        vault,
+        warnings,
+        categoryCounts: record.categoryCounts,
+        responseReferencedTokens: referenced,
+        toolRestoredTokens: toolRestored,
+      },
     };
   }
 

@@ -1,4 +1,4 @@
-import type { Category } from "./types.js";
+import { LITERAL_CATEGORY, type Category } from "./types.js";
 
 export interface VaultEntry {
   token: string;
@@ -9,8 +9,8 @@ export interface VaultEntry {
 /**
  * Bidirectional token <-> value store for one request.
  *
- * Scope: a vault should live for exactly one model round trip (or one
- * multi-turn tool loop). Do not reuse a vault across users or sessions:
+ * Scope: one round trip, one tool loop, or one conversation; never across
+ * conversations or users (see ADR 0003). Do not reuse a vault across users or sessions:
  * token numbering is only meaningful inside it, and keeping originals around
  * longer than needed widens the blast radius of a memory dump or a logged
  * object. Persistent implementations should set a short TTL (minutes).
@@ -85,7 +85,8 @@ export class InMemoryVault implements Vault {
   }
 
   static #key(value: string, category: Category): string {
-    return `${category}\u0000${normalizeValue(value)}`;
+    // Escaped literals must round-trip to their exact spelling, so "{{ssn_1}}" and "{{SSN_1}}" get separate tokens.
+    return `${category}\u0000${category === LITERAL_CATEGORY ? value : normalizeValue(value)}`;
   }
 }
 

@@ -12,8 +12,8 @@ export type {
   Policy,
   PolicyAction,
 } from "./types.js";
-export { BUILT_IN_CATEGORIES } from "./types.js";
-export { PiiBlockedError, UnsupportedContentError } from "./errors.js";
+export { BUILT_IN_CATEGORIES, LITERAL_CATEGORY } from "./types.js";
+export { PiiBlockedError, PiiGateInvariantError, UnsupportedContentError } from "./errors.js";
 
 export {
   addressDetector,
@@ -42,7 +42,14 @@ export { collectFindings, mask, maskAll } from "./mask.js";
 export type { MaskAllResult, MaskFinding, MaskOptions, MaskResult, SchemaHint, SchemaHints } from "./mask.js";
 
 export { countTokens, unmask, unmaskDeep } from "./unmask.js";
-export type { UnmaskDeepResult, UnmaskResult, UnmaskWarning, UnmaskWarningKind } from "./unmask.js";
+export type {
+  RestoreFilter,
+  UnmaskDeepResult,
+  UnmaskOptions,
+  UnmaskResult,
+  UnmaskWarning,
+  UnmaskWarningKind,
+} from "./unmask.js";
 
 export type { AuditLogger, AuditRecord } from "./audit.js";
 
@@ -54,6 +61,8 @@ export type {
   MessageLike,
   MessageParamLike,
   MessagesClientLike,
+  RestoreToolInputs,
+  ToolRestorePredicate,
   WrapAnthropicOptions,
   WrappedAnthropic,
 } from "./anthropic.js";

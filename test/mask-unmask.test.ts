@@ -193,6 +193,7 @@ describe("unmask round trip", () => {
       text: "Draft: Hi Maria Gonzalez, we confirmed (512) 555-0198 and will email maria@example.com.",
       warnings: [],
       restored: 3,
+      restoredByCategory: { PERSON: 1, PHONE: 1, EMAIL: 1 },
     });
   });
 

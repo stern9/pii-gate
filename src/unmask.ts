@@ -1,7 +1,13 @@
-import type { JsonValue } from "./types.js";
+import { LITERAL_CATEGORY, addCount, nullRecord, type Category, type JsonValue } from "./types.js";
 import type { Vault } from "./vault.js";
 
-export type UnmaskWarningKind = "near-match" | "unknown-token";
+/**
+ * - `near-match`: a damaged placeholder, left as written (see `suggestion`).
+ * - `unknown-token`: an exact placeholder the vault never issued, left as written.
+ * - `withheld`: a valid placeholder deliberately left unrestored by a restore
+ *   filter (e.g. the wrapper's `restoreToolInputs`). Not a model error.
+ */
+export type UnmaskWarningKind = "near-match" | "unknown-token" | "withheld";
 
 /** Warnings carry tokens and positions only — never the original values. */
 export interface UnmaskWarning {
@@ -20,12 +26,28 @@ export interface UnmaskResult {
   warnings: UnmaskWarning[];
   /** Number of placeholders restored. */
   restored: number;
+  /** `restored`, split by category (`LITERAL` included). */
+  restoredByCategory: Record<string, number>;
 }
 
 export interface UnmaskDeepResult<T> {
   value: T;
   warnings: UnmaskWarning[];
   restored: number;
+  restoredByCategory: Record<string, number>;
+}
+
+/**
+ * Decides whether one known placeholder is restored. `path` is the JSON
+ * Pointer of the string inside the value for `unmaskDeep` ("" for `unmask`).
+ * Return false to leave the token in place; it is reported as `withheld`.
+ * Never consulted for `LITERAL` tokens (escaped input text, not PII), which
+ * are always restored, nor for tokens the vault does not hold.
+ */
+export type RestoreFilter = (token: string, category: Category, path: string) => boolean;
+
+export interface UnmaskOptions {
+  shouldRestore?: RestoreFilter;
 }
 
 const EXACT_TOKEN = /\{\{([A-Z][A-Z0-9_]*_\d+)\}\}/g;
@@ -78,23 +100,39 @@ function nearMatchWarnings(text: string, vault: Vault, exact: readonly Span[]): 
  * looks like a damaged placeholder is reported in `warnings` and left as-is:
  * guessing could put one customer's data into a sentence about another.
  */
-export function unmask(text: string, vault: Vault): UnmaskResult {
+export function unmask(text: string, vault: Vault, options: UnmaskOptions = {}): UnmaskResult {
+  return unmaskAt(text, vault, options, "");
+}
+
+/** Category part of an exact token's inner text: `A_B_12` -> `A_B`. */
+function categoryOf(inner: string): Category {
+  return inner.replace(/_\d+$/, "");
+}
+
+function unmaskAt(text: string, vault: Vault, options: UnmaskOptions, path: string): UnmaskResult {
   const warnings: UnmaskWarning[] = [];
   const exactSpans: Span[] = [];
+  const restoredByCategory = nullRecord<number>();
   let restored = 0;
-  const out = text.replace(EXACT_TOKEN, (token: string, _inner: string, index: number) => {
+  const out = text.replace(EXACT_TOKEN, (token: string, inner: string, index: number) => {
     exactSpans.push({ start: index, end: index + token.length });
     const value = vault.get(token);
     if (value === undefined) {
       warnings.push({ kind: "unknown-token", found: token, index });
       return token;
     }
+    const category = categoryOf(inner);
+    if (category !== LITERAL_CATEGORY && options.shouldRestore?.(token, category, path) === false) {
+      warnings.push({ kind: "withheld", found: token, index });
+      return token;
+    }
     restored++;
+    addCount(restoredByCategory, category);
     return value;
   });
   warnings.push(...nearMatchWarnings(text, vault, exactSpans));
   warnings.sort((a, b) => a.index - b.index);
-  return { text: out, warnings, restored };
+  return { text: out, warnings, restored, restoredByCategory };
 }
 
 function escapePointer(segment: string): string {
@@ -103,35 +141,44 @@ function escapePointer(segment: string): string {
 
 interface DeepState {
   vault: Vault;
+  options: UnmaskOptions;
   warnings: UnmaskWarning[];
   restored: number;
+  restoredByCategory: Record<string, number>;
 }
 
 function walk(value: unknown, path: string, state: DeepState): unknown {
   if (typeof value === "string") {
-    const r = unmask(value, state.vault);
+    const r = unmaskAt(value, state.vault, state.options, path);
     state.restored += r.restored;
+    for (const [category, n] of Object.entries(r.restoredByCategory)) {
+      addCount(state.restoredByCategory, category, n);
+    }
     state.warnings.push(...r.warnings.map((w) => ({ ...w, path })));
     return r.text;
   }
   if (Array.isArray(value)) return value.map((item, i) => walk(item, `${path}/${i}`, state));
   if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = walk(v, `${path}/${escapePointer(k)}`, state);
-    return out;
+    // fromEntries defines own properties, so a JSON key "__proto__" stays a key instead of setting the prototype.
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, `${path}/${escapePointer(k)}`, state)]));
   }
   return value;
 }
 
 /**
  * Walks any JSON-like value (e.g. tool_use `input`) and unmasks every string.
- * Object keys are left untouched. Returns a new value; the input is not mutated.
+ * Object keys are left untouched. `options.shouldRestore` can hold back
+ * individual tokens by category and JSON Pointer path. Returns a new value; the input is not mutated.
  */
-export function unmaskDeep<T extends JsonValue | object>(value: T, vault: Vault): UnmaskDeepResult<T> {
-  const state: DeepState = { vault, warnings: [], restored: 0 };
+export function unmaskDeep<T extends JsonValue | object>(
+  value: T,
+  vault: Vault,
+  options: UnmaskOptions = {},
+): UnmaskDeepResult<T> {
+  const state: DeepState = { vault, options, warnings: [], restored: 0, restoredByCategory: nullRecord<number>() };
   // walk() preserves shape: only string leaves change, so the cast is sound.
   const out = walk(value, "", state) as T;
-  return { value: out, warnings: state.warnings, restored: state.restored };
+  return { value: out, warnings: state.warnings, restored: state.restored, restoredByCategory: state.restoredByCategory };
 }
 
 /** Counts exact placeholder occurrences (known or not) in a string. */

@@ -1,6 +1,6 @@
 import { defaultDetectors, resolveOverlaps } from "./detectors/index.js";
 import { PiiBlockedError } from "./errors.js";
-import { assertValidCategory } from "./types.js";
+import { LITERAL_CATEGORY, addCount, assertValidCategory, nullRecord } from "./types.js";
 import type { Category, Detector, Finding, Policy, PolicyAction } from "./types.js";
 import { InMemoryVault, normalizeValue, type Vault } from "./vault.js";
 
@@ -40,6 +40,25 @@ export interface MaskOptions {
    * Over-masks shared words (a surname that is also a street name).
    */
   propagateNameParts?: boolean;
+  /**
+   * Default true. Placeholder-shaped text already in the input (a `{{SSN_1}}`
+   * typed by a user or planted in a document, or a case/whitespace variant such
+   * as `{{ssn_1}}` or `{{ SSN_1 }}`) is masked as the
+   * reserved category `LITERAL`, so the model sees `{{LITERAL_1}}` and
+   * unmasking gives back the literal text `{{SSN_1}}`, never a vault value.
+   * `false` passes such text through unchanged (pre-ADR-0002 behaviour), where
+   * a planted token is restored to whatever the vault holds under that name.
+   * Each spelling round-trips exactly. Mangled forms (`{{SSN_1}`, `[[SSN_1]]`) are not escaped.
+   */
+  escapePlaceholders?: boolean;
+  /**
+   * Default false. Leave exact tokens that the vault already held *before this
+   * call* unescaped. Only for replayed assistant output (history the model
+   * wrote and the caller resends) with a conversation-scoped vault. Tokens the
+   * same call allocates never count, so a stale `{{PERSON_1}}` cannot bind to a
+   * new value. Has no effect when `escapePlaceholders` is false.
+   */
+  keepIssuedPlaceholders?: boolean;
 }
 
 export interface MaskFinding extends Finding {
@@ -57,6 +76,46 @@ export interface MaskResult {
 const HINT_CONFIDENCE = 1;
 const MIN_HINT_LENGTH = 2;
 const MIN_PROPAGATION_LENGTH = 3;
+const DEFAULT_MIN_CONFIDENCE = 0.5;
+/**
+ * Placeholder-shaped text to escape: exact tokens plus case and inner-whitespace
+ * variants (`{{ssn_1}}`, `{{ SSN_1 }}`) that a model could normalise into a real
+ * token. Single-brace and bracket forms are left alone (too many false positives).
+ */
+const PLACEHOLDER = /\{\{\s*[A-Za-z][A-Za-z0-9_]*_\d+\s*\}\}/g;
+
+/**
+ * Exact placeholder-shaped spans already present in `text`. Those whose token is
+ * in `issued` are returned as `kept` (left as written, but no other finding may
+ * overlap them); the rest become LITERAL findings that win over everything.
+ */
+function placeholderSpans(
+  text: string,
+  options: MaskOptions,
+  issued: ReadonlySet<string>,
+): { literals: Finding[]; kept: Finding[] } {
+  const literals: Finding[] = [];
+  const kept: Finding[] = [];
+  if (options.escapePlaceholders === false) return { literals, kept };
+  for (const m of text.matchAll(PLACEHOLDER)) {
+    const f: Finding = {
+      category: LITERAL_CATEGORY,
+      start: m.index,
+      end: m.index + m[0].length,
+      value: m[0],
+      confidence: 1,
+      detector: "placeholder-escape",
+    };
+    (options.keepIssuedPlaceholders === true && issued.has(m[0]) ? kept : literals).push(f);
+  }
+  return { literals, kept };
+}
+
+/** Tokens the vault holds right now; taken before a call allocates anything. */
+function issuedTokens(vault: Vault | undefined, options: MaskOptions): ReadonlySet<string> {
+  if (!vault || options.keepIssuedPlaceholders !== true) return new Set();
+  return new Set(vault.entries().map((e) => e.token));
+}
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -126,9 +185,13 @@ export function propagateFindings(
   text: string,
   seeds: readonly Seed[],
   existing: readonly Finding[],
-  options: Pick<MaskOptions, "propagateNameParts"> = {},
+  options: Pick<MaskOptions, "propagateNameParts" | "minConfidence"> = {},
 ): Finding[] {
-  const expanded: readonly ExpandedSeed[] = options.propagateNameParts === false ? seeds : withNameParts(seeds);
+  const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
+  const usable = seeds.filter((s) => s.category !== LITERAL_CATEGORY);
+  const all: readonly ExpandedSeed[] = options.propagateNameParts === false ? usable : withNameParts(usable);
+  // Propagated findings obey the same cutoff as detected ones (name parts carry confidence x 0.8).
+  const expanded = all.filter((s) => s.confidence >= minConfidence);
   const seen = new Set<string>();
   const extra: Finding[] = [];
   for (const seed of expanded) {
@@ -183,29 +246,46 @@ function withNameParts(seeds: readonly Seed[]): ExpandedSeed[] {
  * a hint are dropped.
  */
 export function detectFindings(text: string, options: MaskOptions = {}): Finding[] {
-  const hints = resolveOverlaps(hintFindings(text, options.schemaHints));
-  const minConfidence = options.minConfidence ?? 0.5;
-  const detected = (options.detectors ?? defaultDetectors())
-    .flatMap((d) => d.detect(text))
-    .filter((f) => f.confidence >= minConfidence && !overlapsAny(f, hints));
-  for (const f of detected) assertValidCategory(f.category);
-  return [...hints, ...resolveOverlaps(detected)].sort((a, b) => a.start - b.start);
+  return analyze(text, options, issuedTokens(options.vault, options)).findings;
+}
+
+interface Analysis {
+  /** Findings to apply, including LITERAL escapes. */
+  findings: Finding[];
+  /** Spans no propagated finding may touch: everything in `findings` plus kept (issued) placeholders. */
+  occupied: Finding[];
+}
+
+function analyze(text: string, options: MaskOptions, issued: ReadonlySet<string>): Analysis {
+  const { literals, kept } = placeholderSpans(text, options, issued);
+  const reserved = [...literals, ...kept];
+  const hints = resolveOverlaps(hintFindings(text, options.schemaHints).filter((f) => !overlapsAny(f, reserved)));
+  const minConfidence = options.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
+  const raw = (options.detectors ?? defaultDetectors()).flatMap((d) => d.detect(text));
+  for (const f of raw) assertValidCategory(f.category);
+  const detected = raw.filter(
+    (f) => f.confidence >= minConfidence && !overlapsAny(f, hints) && !overlapsAny(f, reserved),
+  );
+  const findings = [...literals, ...hints, ...resolveOverlaps(detected)].sort((a, b) => a.start - b.start);
+  return { findings, occupied: [...findings, ...kept] };
 }
 
 /** Final, non-overlapping findings for a single text, sorted by position. */
 export function collectFindings(text: string, options: MaskOptions = {}): Finding[] {
-  const base = detectFindings(text, options);
-  if (options.propagate === false) return base;
-  return [...base, ...propagateFindings(text, base, base, options)].sort((a, b) => a.start - b.start);
+  const { findings, occupied } = analyze(text, options, issuedTokens(options.vault, options));
+  if (options.propagate === false) return findings;
+  return [...findings, ...propagateFindings(text, findings, occupied, options)].sort((a, b) => a.start - b.start);
 }
 
 export function actionFor(category: Category, options: Pick<MaskOptions, "policy" | "defaultAction">): PolicyAction {
+  // Escaped placeholder text is not PII and must never pass through or block: it is always masked.
+  if (category === LITERAL_CATEGORY) return "mask";
   return options.policy?.[category] ?? options.defaultAction ?? "mask";
 }
 
 export function countByCategory(findings: readonly Pick<Finding, "category">[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const f of findings) counts[f.category] = (counts[f.category] ?? 0) + 1;
+  const counts = nullRecord<number>();
+  for (const f of findings) addCount(counts, f.category);
   return counts;
 }
 
@@ -262,17 +342,41 @@ export interface MaskAllResult {
  *  - values already in a reused vault are masked wherever they reappear.
  */
 export function maskAll(texts: readonly string[], options: MaskOptions = {}): MaskAllResult {
+  return maskTexts(
+    texts.map((text) => ({ text })),
+    options,
+  );
+}
+
+/** One text for `maskTexts`; `keepIssuedPlaceholders` overrides the option for this text only. */
+export interface MaskInput {
+  text: string;
+  keepIssuedPlaceholders?: boolean;
+}
+
+/**
+ * `maskAll` with a per-text `keepIssuedPlaceholders`, so the Anthropic wrapper
+ * can exempt replayed assistant turns only. The issued-token snapshot is taken
+ * once, before detection, so tokens allocated by this call never count.
+ */
+export function maskTexts(inputs: readonly MaskInput[], options: MaskOptions = {}): MaskAllResult {
   const vault = options.vault ?? new InMemoryVault();
-  const base = texts.map((t) => detectFindings(t, options));
+  const issued = new Set(vault.entries().map((e) => e.token));
+  const none: ReadonlySet<string> = new Set();
+  const analyses = inputs.map((input) => {
+    const keep = input.keepIssuedPlaceholders ?? options.keepIssuedPlaceholders ?? false;
+    return analyze(input.text, { ...options, keepIssuedPlaceholders: keep }, keep ? issued : none);
+  });
+  const base = analyses.map((a) => a.findings);
   const perText =
     options.propagate === false
       ? base
-      : base.map((own, i) => {
+      : analyses.map(({ findings: own, occupied }, i) => {
           const seeds: Seed[] = [...base.flat(), ...vault.entries().map((e) => ({ ...e, confidence: 1 }))];
-          const extra = propagateFindings(texts[i] ?? "", seeds, own, options);
+          const extra = propagateFindings(inputs[i]?.text ?? "", seeds, occupied, options);
           return [...own, ...extra].sort((a, b) => a.start - b.start);
         });
   assertNotBlocked(perText.flat(), options);
-  const results = texts.map((t, i) => applyFindings(t, perText[i] ?? [], vault, options));
+  const results = inputs.map((input, i) => applyFindings(input.text, perText[i] ?? [], vault, options));
   return { masked: results.map((r) => r.masked), vault, findings: results.map((r) => r.findings) };
 }
