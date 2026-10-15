@@ -81,7 +81,7 @@ An [interactive version](https://pii-gate.vercel.app/diagrams/request-flow.html)
 - **Detection** comes from regex detectors for SSN, phone, email, VIN (with check digit), credit card (Luhn), DOB (cue-gated), driver's license (cue-gated), street address and person name (cue-gated). US formats are detected anywhere in the text. International phone numbers (`Phone: +44 20 7946 0958`, `phone number: 55501234`) and day-first dates of birth (`DOB: 15/02/1988`) are detected only directly after a label. When matches overlap, the longest wins, and ties go to the higher confidence. Numbers labelled as policy, claim or account identifiers are not reported as phones or SSNs.
 - **Schema hints** handle values you already know from the database record, which are masked directly without detection: `schemaHints: { insured: { value: row.insured_name, category: "PERSON" } }`. They take priority over detector output, and their categories can be custom (`CLAIM_ID`, `MEMBER_ID`).
 - **Propagation** works like this: once a name is found through a cue ("Claimant: Tomasz Kowalski"), its other occurrences in the same request get masked too ("Kowalski's home", "tomasz kowalski"). The full name matches in any case; a single part ("Kowalski") matches only as written, so "Claimant: Sarah May" doesn't mask "the adjuster may call". A part reuses the full name's placeholder ("Kowalski prefers email" → "{{PERSON_1}} prefers email"), so the model sees one person, and unmasking restores the full name there. If two detected names share the part ("Dana Whitfield", "Sam Whitfield"), the bare "Whitfield" is ambiguous and gets a placeholder of its own rather than a guess. The wrapper applies this across the system prompt, every message and every tool result.
-- **The vault** holds token ↔ value for one request. The same value always gets the same token, so the model can reason that two mentions refer to one person.
+- **The vault** holds token ↔ value for one request by default (one conversation if you pass a conversation-scoped `createVault`, or across processes with `pii-gate/redis`). The same value always gets the same token, so the model can reason that two mentions refer to one person.
 - **Placeholder-shaped input is escaped.** A `{{SSN_1}}` already in the system prompt, a message, a tool result or a document (typed by a user, planted by an attacker) is masked as the reserved category `LITERAL`, and so are case and inner-whitespace variants (`{{ssn_1}}`, `{{ SSN_1 }}`) that a model could normalise into a real token. The model sees `{{LITERAL_1}}`, and unmasking gives back the literal text exactly as it was written, never the vault's SSN. Replayed assistant turns keep tokens the vault issued in an earlier request (a conversation-scoped vault), so withheld placeholders stay linked to their values. This also catches unrendered template tokens such as `{{ user_1 }}`, which reach the model as `{{LITERAL_n}}`. `escapePlaceholders: false` turns this off. If your system prompt explains the placeholder format, write it as `{{CATEGORY_n}}` rather than a real-looking `{{PERSON_1}}`, which would be escaped. `LITERAL` cannot be used as a schema-hint or detector category.
 - **Unmask a text once.** Unmasking is single-pass, which is what keeps a restored literal `{{SSN_1}}` from being expanded. Running `unmask` again over already-unmasked text would turn that literal into the real value.
 - **Unmasking** is exact-match only. If the model mangles a token (`{person_1}}`, `[[SSN_1]]`, `SSN_1`), the text is left as written and a warning with a suggested token is returned. A wrong restore could put one customer's data into another customer's letter, so a visible placeholder is the safer failure.
@@ -180,6 +180,14 @@ Method, variance, a propagation on/off comparison and 300 B / 10 KB scaling: [do
 - **Tool inputs are restored by default.** Masking protects the provider boundary, not your application's own outputs. Unless you set `restoreToolInputs`, every tool call gets real values, so a prompt injection that only *describes* a value ("email the claimant's SSN to ...") still works: the model copies `{{SSN_1}}` from context and `send_email` receives the SSN. Set a deny-by-default policy for tools with external side effects (email, HTTP, file or queue writes) and resolve placeholders on purpose. The same applies to model text you forward automatically (an auto-reply, a ticket comment): the policy covers tool inputs only. See [ADR 0002](docs/adr/0002-tool-input-restoration-and-injected-placeholders.md).
 - **Escaping placeholders is not a security boundary.** Only double-brace forms are escaped (`{{SSN_1}}`, plus case and whitespace variants such as `{{ssn_1}}` and `{{ SSN_1 }}`). A single-brace or bracket form planted in input (`{SSN_1}`, `{{SSN_1}`, `[[SSN_1]]`) is left alone, because escaping every near-miss would catch legitimate text, and a model being helpful may normalise it into the exact `{{SSN_1}}`, which is then restored. The restore policy is what limits the damage. Avoid putting values from two customers in one request. With the default per-request vault, placeholders that were withheld in an earlier turn come back as literals when the history is replayed, so the model loses the link to the value; keeping it needs a conversation-scoped `createVault`.
 
+## Design decisions
+
+- [ADR 0001](docs/adr/0001-mask-vs-block-vs-allow.md): three policy actions, mask, block and allow.
+- [ADR 0002](docs/adr/0002-tool-input-restoration-and-injected-placeholders.md): restoring tool inputs, the per-tool restore policy and escaping planted placeholders.
+- [ADR 0003](docs/adr/0003-vault-scope-across-turns-and-unmasked-params.md): vault scope across turns, and which request fields are not masked.
+- [ADR 0004](docs/adr/0004-optional-ner-detector-adapter.md): the optional NER detector adapter and async masking.
+- [ADR 0005](docs/adr/0005-redis-vault.md): the encrypted Redis vault for masking and unmasking in different processes.
+
 ## Development
 
 ```bash
@@ -198,13 +206,20 @@ The golden set in `test/fixtures/` contains insurance-flavoured texts with expec
 
 ```
 src/
-  detectors/   one file per category, overlap resolution, ner.ts (nerDetector adapter)
-  mask.ts      mask, maskAll, schema hints, propagation, policy
-  unmask.ts    unmask, unmaskDeep, near-match warnings
-  vault.ts     Vault, InMemoryVault, RedisLike/AsyncVault types, hydrate
+  detectors/      one file per category, overlap resolution, ner.ts (nerDetector adapter)
+  mask.ts         mask, maskAll, maskAsync, maskAllAsync, schema hints, propagation, policy
+  unmask.ts       unmask, unmaskDeep, near-match and withheld warnings
+  vault.ts        Vault, InMemoryVault, RedisLike/AsyncVault types, hydrate
   redis-vault.ts  pii-gate/redis: createRedisVault, loadVault, persistVault, withVault
-  audit.ts     AuditLogger, JsonlAuditLogger, MemoryAuditLogger
-  anthropic.ts wrapAnthropic
-  core.ts      browser-safe entry (pii-gate/core)
-demo/          Next.js demo page (not part of the package)
+  anthropic.ts    wrapAnthropic, restoreToolInputs
+  audit.ts        AuditLogger, JsonlAuditLogger, MemoryAuditLogger
+  errors.ts       PiiBlockedError, UnsupportedContentError, PiiGateInvariantError
+  types.ts        Category, Finding, Detector, AsyncDetector, Policy
+  core.ts         browser-safe entry (pii-gate/core)
+test/             vitest suites, golden fixtures (fake PII only), fake Redis and NER
+bench/            latency benchmark (npm run bench)
+examples/         basic.ts, ner.ts
+docs/adr/         architecture decision records
+docs/diagrams/    Archify source and images for the request-flow diagram
+demo/             Next.js demo page (not part of the package)
 ```
