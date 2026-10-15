@@ -36,6 +36,8 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
   const resultsRef = useRef<HTMLDivElement>(null);
   const scrollNext = useRef(false); // scroll only after a run the visitor started
   const epoch = useRef(0); // bumped on every change, so a stale run can't land
+  const [lit, setLit] = useState<number>(STEPS.length); // chips shown at their run state; later ones wait (reveal)
+  const timers = useRef(new Set<number>());
 
   const sample = SAMPLES.find((s) => s.id === sampleId);
   const isCustom = !sample;
@@ -57,8 +59,32 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
     // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on the initial note
   }, []);
 
+  // Drop pending reveal timers on unmount.
+  useEffect(() => {
+    const t = timers.current;
+    return () => t.forEach(clearTimeout);
+  }, []);
+
+  /** Automatic first run only: light steps 3–5 at 900/1200/1500 ms, once the headline has been read. */
+  function reveal() {
+    timers.current.forEach(clearTimeout);
+    timers.current.clear();
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return setLit(STEPS.length);
+    setLit(2);
+    for (let n = 3; n <= STEPS.length; n++) {
+      const id = window.setTimeout(() => {
+        timers.current.delete(id);
+        setLit(n);
+      }, 900 + (n - 3) * 300);
+      timers.current.add(id);
+    }
+  }
+
   function reset() {
     epoch.current++;
+    timers.current.forEach(clearTimeout);
+    timers.current.clear();
+    setLit(STEPS.length);
     setRun(null);
     setRequestError(null);
   }
@@ -89,6 +115,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
       if (at !== epoch.current) return;
       scrollNext.current = scroll;
       fn();
+      if (!scroll) reveal(); // user runs light at once: the scroll takes the strip off-screen anyway
     };
     try {
       if (useMode === "simulated") {
@@ -132,7 +159,7 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
           puts the real values back in the reply. Most LLM tasks on this text (summarise, draft, route) don&apos;t need
           the real values.
         </p>
-        <Pipeline run={run} />
+        <Pipeline run={run} lit={lit} />
       </header>
 
       <div className="flex flex-col gap-2">
@@ -305,9 +332,18 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
         </CardContent>
       </Card>
 
-      <div ref={resultsRef} className="flex scroll-mt-4 flex-col gap-4" aria-live="polite">
+      {/* One line for screen readers; the card itself isn't live, so its tabs and JSON aren't read out. */}
+      <p className="sr-only" role="status">
+        {requestError ? "Live Claude didn't answer." : run ? runStatus(run) : ""}
+      </p>
+      <div ref={resultsRef} className="flex scroll-mt-4 flex-col gap-4">
         {requestError && <LiveUnavailable reason={requestError} onSimulate={useSimulated} />}
-        {run && <Results run={run} onSimulate={useSimulated} />}
+        {run && (
+          // Fades in with step 4; already in the layout, so nothing shifts.
+          <div className={cn("transition-opacity duration-300 motion-reduce:transition-none", lit < 4 && "opacity-0")}>
+            <Results run={run} onSimulate={useSimulated} />
+          </div>
+        )}
       </div>
 
       <footer id="fake-data" className="mt-6 scroll-mt-4 border-t pt-6 text-sm text-muted-foreground">
@@ -322,6 +358,18 @@ export function Demo({ liveAvailable, liveModel }: { liveAvailable: boolean; liv
       </footer>
     </main>
   );
+}
+
+/** The live-region line for a finished run. */
+function runStatus(run: GateRun): string {
+  if (!run.ok) {
+    if (run.error.upstream) return "Claude couldn't be reached. Nothing unmasked left the server.";
+    return run.error.blockedCategories ? "Blocked: nothing reached the model." : `Rejected: ${run.error.name}.`;
+  }
+  if (run.stopReason === "refusal") return "The model declined this request.";
+  const n = run.restoredValues?.length ?? 0, w = run.warnings.length;
+  const flagged = w ? ` ${w} mistyped ${w === 1 ? "placeholder" : "placeholders"} flagged, not guessed.` : "";
+  return `Reply received: ${n} ${n === 1 ? "placeholder" : "placeholders"} restored.${flagged}`;
 }
 
 type StepState = "on" | "off" | "skipped";
@@ -342,17 +390,18 @@ function stepStates(run: GateRun | null): StepState[] {
 }
 
 /** Phones: a compact list. Wider: five equal-height chips joined by arrows. */
-function Pipeline({ run }: { run: GateRun | null }) {
-  const states = stepStates(run);
+/** `lit`: chips past it still look idle while the reveal plays; screen readers get the final state. */
+function Pipeline({ run, lit }: { run: GateRun | null; lit: number }) {
+  const final = stepStates(run);
   return (
     <ol className="grid gap-1.5 pt-1 sm:grid-cols-5 sm:gap-5" aria-label="How pii-gate handles a request">
       {STEPS.map((step, i) => {
-        const state = states[i] as StepState;
+        const state: StepState = i < lit ? (final[i] as StepState) : "off";
         return (
           <li
             key={step.name}
             className={cn(
-              "relative flex items-start gap-2 transition-colors sm:rounded-lg sm:border sm:px-2.5 sm:py-1.5",
+              "relative flex items-start gap-2 transition-[color,background-color,border-color,opacity] duration-300 motion-reduce:transition-none sm:rounded-lg sm:border sm:px-2.5 sm:py-1.5",
               state === "on" ? "sm:border-primary/40 sm:bg-primary/5" : "text-muted-foreground sm:border-dashed",
               state === "skipped" && "opacity-50",
             )}
@@ -370,7 +419,7 @@ function Pipeline({ run }: { run: GateRun | null }) {
               <span className={cn("text-sm font-medium", state === "skipped" && "line-through")}>
                 {step.name}
                 <span className="sr-only">
-                  {state === "on" ? " (done)" : state === "skipped" ? " (skipped)" : " (after you ask)"}
+                  {final[i] === "on" ? " (done)" : final[i] === "skipped" ? " (skipped)" : " (after you ask)"}
                 </span>
               </span>
               <span className="text-xs leading-4 text-muted-foreground">{step.body}</span>
