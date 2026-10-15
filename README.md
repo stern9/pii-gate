@@ -99,6 +99,12 @@ Each category gets one action. Categories you don't list use `defaultAction`, wh
 
 See [docs/adr/0001-mask-vs-block-vs-allow.md](docs/adr/0001-mask-vs-block-vs-allow.md) for why there are three actions rather than one.
 
+## Performance
+
+On an Apple M5 Pro (Node 24, built `dist/`), a wrapped `messages.create` on a 2.6 KB request (system + 3 messages + tool_result, reply with 12 placeholders) spends ~0.25 ms p50 / ~0.30 ms p95 in the gate; the fake client it wraps resolves at the timer floor. Masking a ~2 KB claim note alone takes ~0.07 ms. A model call takes hundreds of ms to seconds, so the gate is noise.
+Cold start is the exception: measured after module import (which adds a few ms), the first `mask` in a fresh process takes ~15 ms while V8 warms up, so a first wrapped call costs roughly 15 + 2 ms.
+Method, variance, a propagation on/off comparison and 300 B / 10 KB scaling: [docs/benchmarks.md](docs/benchmarks.md). Reproduce with `npm run bench`.
+
 ## Limitations
 
 - **Regex misses things.** The detectors are tuned for precision. A name with no cue ("spoke with Maria about the claim") is not detected unless it also appears with a cue, or you pass it as a schema hint. Non-US formats are covered only where a label makes them unambiguous: international phone numbers are detected only after a phone label (phone, tel, mobile, cell, contact number, ...), and day-first dates of birth only after a birth cue. An unlabelled international number or day-first date passes through. Other national IDs and non-NANP addresses are not covered. PO boxes, rural routes and addresses that wrap across lines are missed, and the address detector masks the street line only — city, state and ZIP pass through, which is usually acceptable but worth knowing.
@@ -108,16 +114,18 @@ See [docs/adr/0001-mask-vs-block-vs-allow.md](docs/adr/0001-mask-vs-block-vs-all
 - **Name-part propagation is a heuristic.** Parts of a detected name are masked wherever they appear capitalized, so a surname that is also a street name, or "May"/"Bill" at the start of a sentence, gets over-masked. All-caps (`MAY`) and lowercase variants of a single part are not masked unless the full name matches. Because a part shares the full name's placeholder, unmasking writes the full name where only the part appeared ("Kowalski's home" comes back as "Tomasz Kowalski's home"). `propagateNameParts: false` turns parts off.
 - **Restoration is lossy for variants.** Values that differ only in case or whitespace share one token and come back in the first-seen spelling.
 - **Content the wrapper can't read is rejected.** Images, PDFs, server-tool blocks and streaming throw `UnsupportedContentError` by default (`unsupportedContent: "passthrough"` overrides this). Thinking blocks pass through unchanged because their signatures forbid edits.
-- **Placeholders can be prompt-injected.** A user who types `{{PERSON_1}}` into a message gets it restored in the reply, but only to a value from the same request. Avoid putting values from two customers in one request.
+- **Masking doesn't stop exfiltration through tools.** The wrapper restores real values into `tool_use.input`, so a prompt injection in a document or tool result can get the model to call, say, `send_email` with `{{SSN_1}}`, and your handler receives the real SSN. Handlers with external side effects (email, HTTP, file writes) should get placeholders and resolve them on purpose. The wrapper can't do that yet: `create` and `createWithReport` both return the already-unmasked message. Until a per-tool `restoreToolInputs` option lands, call `maskAll` and the client yourself for those flows, and `unmask` only the tool inputs you trust. See [ADR 0002](docs/adr/0002-tool-input-restoration-and-injected-placeholders.md).
+- **Placeholders can be prompt-injected.** Placeholder-shaped text already in the input (`{{PERSON_1}}` typed by a user or planted in a document) is not escaped and will be restored, but only to a value from the same request. Escaping exact tokens is planned (ADR 0002). Even then, a mangled form like `{{SSN_1}` can be "fixed" by the model into a real token. Avoid putting values from two customers in one request.
 
 ## Development
 
 ```bash
 npm install
 npm test          # vitest
-npm run typecheck # strict tsc over src, test, examples
+npm run typecheck # strict tsc over src, test, examples, bench
 npm run build     # emits dist/
 npm run example
+npm run bench     # latency benchmark, writes docs/benchmarks.md
 ```
 
 The golden set in `test/fixtures/` contains insurance-flavoured texts with expected findings per category. All PII in it is fake: 555-01xx phone numbers, UK numbers from Ofcom's drama ranges (020 7946 0xxx, 07700 900xxx), `example.*` domains, test card numbers and synthetic VINs with valid check digits.

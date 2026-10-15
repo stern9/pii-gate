@@ -32,6 +32,7 @@ Flow: app → `mask()` (detect → typed placeholders like `{{PERSON_1}}`, origi
 - Name propagation can over-mask a surname that is also a street name (`propagateNameParts: false` turns it off).
 - A propagated name part reuses the full name's token, so unmask restores the full name where only the part appeared. A part shared by two detected names is ambiguous and gets its own token (no guessing).
 - US formats are detected anywhere; international phones and day-first DOBs only directly after a label (unlabelled non-US formats pass through).
+- Tool inputs are restored with real values, so masking doesn't prevent exfiltration through tool calls, and placeholder-shaped text already in the input isn't escaped. See ADR 0002 (Proposed). Escaping exact tokens only narrows the risk; the per-tool restore policy is the real control. When implementing, don't escape vault-known tokens in replayed assistant turns. Don't change the default restore behaviour without updating the ADR.
 
 ## Roadmap ideas
-Next.js demo page (paste note → masked / restored / audit row), latency benchmark on a ~2 KB note, optional NER detector adapter, Redis vault implementation.
+Done: Next.js demo (`demo/`, live at pii-gate-eight.vercel.app), latency benchmark (`npm run bench`). Next: implement ADR 0002 (per-tool restore policy, escape planted placeholders), optional NER detector adapter, Redis vault implementation.

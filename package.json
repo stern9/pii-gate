@@ -32,6 +32,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "example": "tsx examples/basic.ts",
+    "bench": "npm run build && tsx bench/latency.ts",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "keywords": [
