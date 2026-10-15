@@ -18,6 +18,10 @@
     "./core": {
       "types": "./dist/core.d.ts",
       "import": "./dist/core.js"
+    },
+    "./redis": {
+      "types": "./dist/redis-vault.d.ts",
+      "import": "./dist/redis-vault.js"
     }
   },
   "files": [
@@ -32,6 +36,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "example": "tsx examples/basic.ts",
+    "example:ner": "tsx examples/ner.ts",
     "bench": "npm run build && tsx bench/latency.ts",
     "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },

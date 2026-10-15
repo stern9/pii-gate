@@ -4,6 +4,7 @@
  * entry adds the audit loggers.
  */
 export type {
+  AsyncDetector,
   BuiltInCategory,
   Category,
   Detector,
@@ -25,6 +26,8 @@ export {
   emailDetector,
   isValidVinCheckDigit,
   luhnValid,
+  NerDetectorError,
+  nerDetector,
   personDetector,
   phoneDetector,
   regexDetector,
@@ -34,12 +37,29 @@ export {
   vinDetector,
 } from "./detectors/index.js";
 export type { DetectOptions, MatchContext, RegexDetectorSpec, RegexRule, VinDetectorOptions } from "./detectors/index.js";
+export type {
+  NerDetectorOptions,
+  NerEntity,
+  NerFailure,
+  NerFailureReason,
+  NerRecognize,
+  NerRecognizeContext,
+  NerRecognizeSync,
+} from "./detectors/index.js";
 
 export { InMemoryVault, formatToken, hydrate } from "./vault.js";
-export type { AsyncVault, RedisLike, RedisVaultFactory, RedisVaultOptions, Vault, VaultEntry } from "./vault.js";
+export type { AsyncVault, HydrateOptions, RedisLike, RedisVaultFactory, RedisVaultOptions, Vault, VaultCipher, VaultEntry, VaultIndexHmac } from "./vault.js";
 
-export { collectFindings, mask, maskAll } from "./mask.js";
-export type { MaskAllResult, MaskFinding, MaskOptions, MaskResult, SchemaHint, SchemaHints } from "./mask.js";
+export { collectFindings, mask, maskAll, maskAllAsync, maskAsync } from "./mask.js";
+export type {
+  MaskAllResult,
+  MaskAsyncOptions,
+  MaskFinding,
+  MaskOptions,
+  MaskResult,
+  SchemaHint,
+  SchemaHints,
+} from "./mask.js";
 
 export { countTokens, unmask, unmaskDeep } from "./unmask.js";
 export type {

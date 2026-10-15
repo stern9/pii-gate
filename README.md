@@ -92,7 +92,7 @@ Every call through `wrapAnthropic` writes exactly one audit record, including ca
 ### Plugging in other detectors
 
 ```ts
-import { defaultDetectors, mask, staticDetector, type Detector } from "pii-gate";
+import { defaultDetectors, mask, type Detector } from "pii-gate";
 
 const memberIds: Detector = {
   name: "member-id",
@@ -102,10 +102,52 @@ const memberIds: Detector = {
   })),
 };
 
-// Async NER: run it first, then feed its spans in.
-const nerSpans = await myNer(text);
-mask(text, { detectors: [...defaultDetectors(), memberIds, staticDetector("ner", nerSpans)] });
+mask(text, { detectors: [...defaultDetectors(), memberIds] });
 ```
+
+### NER for uncued names
+
+Regex finds a name only when something cues it. To catch "spoke with jordan ellery", plug in a named-entity model you already run (transformers.js, a spaCy or cloud NER service, an LLM). pii-gate ships no model and gains no dependency:
+
+```ts
+import { defaultDetectors, maskAsync, nerDetector, wrapAnthropic } from "pii-gate";
+
+const ner = nerDetector({
+  // Return { label, score?, start?, end?, word? }[]; offsets are UTF-16, end-exclusive.
+  recognize: async (text, { signal }) => myNerService(text, signal),
+  timeoutMs: 2000, // aborts `signal`
+  // labels: { PER: "PERSON" } (default), minScore: 0.7, onError: "throw" (default) | "skip"
+});
+const detectors = [...defaultDetectors(), ner];
+
+const { masked, vault } = await maskAsync(note, { detectors });
+const anthropic = wrapAnthropic(new Anthropic(), { detectors }); // async detectors work here too
+```
+
+NER findings go through the same pipeline as regex ones: overlaps (longest wins), schema hints, policy and propagation, so a lowercase "jordan ellery" also masks "Jordan Ellery" elsewhere in the request. `mask()`/`maskAll()` stay synchronous; use `maskAsync`/`maskAllAsync` with async detectors. See `examples/ner.ts` (`npm run example:ner`) and [ADR 0004](docs/adr/0004-optional-ner-detector-adapter.md).
+
+- **Validation.** Spans are checked against the text, grown to whole words and trimmed. Single letters, digit runs, unknown labels and spans or words over 128 characters or 16 tokens are dropped. Only BIO continuations (`B-PER` + `I-PER`) are joined into one name. Locations and organisations aren't mapped unless you add them to `labels`.
+- **Scores.** Entities below `minScore` (0.7) are dropped. Entities without a score bypass `minScore` and are accepted at confidence 0.8.
+- **Offsets vs `word`.** They are compared ignoring case, accents and punctuation ("jose nunez" ↔ "José Núñez", "Jean - Luc" ↔ "Jean-Luc"). Tokenizer pieces (`##son`, `Ġjordan`) are not used as words, so return joined words or offsets.
+- **Caps.** Output that expands past fixed caps (100,000 entities, 10,000 spans from word searches, 100,000 candidate positions examined while searching) counts as a failure rather than being truncated.
+- **Failures.** If `recognize` fails or times out, the call is rejected with `NerDetectorError` (no text in it) and nothing is sent; `onError: "skip"` falls back to regex only. A timed-out call frees its `concurrency` slot right away, but pii-gate can only abort the `signal`, not stop your code: honour the signal, or a slow service can see more than `concurrency` calls in flight.
+- **Trust and cost.** The NER model sees the unmasked text, so run it inside your own trust boundary. Propagation costs O(names × text), roughly 0.5 s for 2,000 NER-found names in 1 MB; for bulk documents, split them or set `propagate: false`.
+
+### Mask in one process, unmask in another
+
+`pii-gate/redis` stores the vault in Redis (any client matching `RedisLike`; node-redis v4 fits as is, ioredis needs a six-line adapter, see ADR 0005). Values are encrypted with your cipher (`createAesGcmCipher`, or a KMS envelope key) and lookup fields are HMACs, so a dump shows no PII. Storing plain text needs an explicit `cipher: "plaintext"`.
+
+```ts
+import { createAesGcmCipher, createRedisVault, loadVault, withVault } from "pii-gate/redis";
+
+const remote = () => createRedisVault({ client, requestId, cipher: createAesGcmCipher(dek), indexKey });
+// Process A: mask and persist, then send `generation` along with the masked text.
+const { result: masked, generation } = await withVault(remote(), (vault) => maskAll(texts, { vault }).masked);
+// Process B: refuses (VaultExpiredError) if the hash was recreated since A persisted.
+const { text } = unmask(reply, await loadVault(remote(), { generation }));
+```
+
+The TTL defaults to 300 s and is refreshed on every write and read; call `clear()` when the request is done. If the key expires and is recreated before A persists, `withVault` re-masks. Afterwards, only B's `generation` check stops a recreated hash from being read as A's, so always pass it. `requestId` appears in clear in Redis key names (SCAN, slow logs, monitoring), so use an opaque id, never a user id or email. See [ADR 0005](docs/adr/0005-redis-vault.md).
 
 ## Policy model
 
@@ -127,8 +169,8 @@ Method, variance, a propagation on/off comparison and 300 B / 10 KB scaling: [do
 
 ## Limitations
 
-- **Regex misses things.** The detectors are tuned for precision. A name with no cue ("spoke with Maria about the claim") is not detected unless it also appears with a cue, or you pass it as a schema hint. Non-US formats are covered only where a label makes them unambiguous: international phone numbers are detected only after a phone label (phone, tel, mobile, cell, contact number, ...), and day-first dates of birth only after a birth cue. An unlabelled international number or day-first date passes through. Other national IDs and non-NANP addresses are not covered. PO boxes, rural routes and addresses that wrap across lines are missed, and the address detector masks the street line only — city, state and ZIP pass through, which is usually acceptable but worth knowing.
-- **NER is still needed for free text.** Adjuster notes and emails mention people, employers, medical providers and places without labels. Plug a named-entity model in through the `Detector` interface (or `staticDetector` for async models) and use regex as a deterministic floor. Even then, nothing here guarantees zero leakage. Treat this as one layer next to data minimisation and vendor agreements.
+- **Regex misses things.** The detectors are tuned for precision. A name with no cue ("spoke with Maria about the claim") is not detected by regex unless it also appears with a cue, or you pass it as a schema hint or add an NER detector (`nerDetector`). Non-US formats are covered only where a label makes them unambiguous: international phone numbers are detected only after a phone label (phone, tel, mobile, cell, contact number, ...), and day-first dates of birth only after a birth cue. An unlabelled international number or day-first date passes through. Other national IDs and non-NANP addresses are not covered. PO boxes, rural routes and addresses that wrap across lines are missed, and the address detector masks the street line only — city, state and ZIP pass through, which is usually acceptable but worth knowing.
+- **NER is optional and only as good as your model.** Adjuster notes and emails mention people, employers, medical providers and places without labels. `nerDetector` plugs in a model you run (see "NER for uncued names"); regex stays the deterministic floor. Only person labels are mapped by default, and filters favour precision (no single letters, `minScore` 0.7), so low-confidence names are missed. NER adds model latency and runs on the whole history every turn. Nothing here guarantees zero leakage; treat it as one layer next to data minimisation and vendor agreements.
 - **Quasi-identifiers pass through.** A loss description ("the only red Tesla on Elm in a town of 400") can identify someone with no PII in it. Detection doesn't address re-identification.
 - **Placeholder numbers are per request by default.** History is masked again on every call, so if it is trimmed, or a name is first cued in a later turn, numbers can shift. Signed thinking blocks then keep stale placeholders that may now name a different person. For multi-turn conversations, pass a conversation-scoped `createVault`: one vault per conversation, never shared across users, with a TTL equal to the conversation's idle timeout. See [ADR 0003](docs/adr/0003-vault-scope-across-turns-and-unmasked-params.md).
 - **Only `system` and `messages` are masked.** `metadata.user_id`, tool names, descriptions and schemas, `tool_choice` and other top-level parameters reach the provider unchanged and are not audited. Use opaque IDs, such as a random or hashed `user_id`, and keep customer data out of tool definitions.
@@ -146,6 +188,7 @@ npm test          # vitest
 npm run typecheck # strict tsc over src, test, examples, bench
 npm run build     # emits dist/
 npm run example
+npm run example:ner
 npm run bench     # latency benchmark, writes docs/benchmarks.md
 ```
 
@@ -155,10 +198,11 @@ The golden set in `test/fixtures/` contains insurance-flavoured texts with expec
 
 ```
 src/
-  detectors/   one file per category, plus overlap resolution
+  detectors/   one file per category, overlap resolution, ner.ts (nerDetector adapter)
   mask.ts      mask, maskAll, schema hints, propagation, policy
   unmask.ts    unmask, unmaskDeep, near-match warnings
-  vault.ts     Vault, InMemoryVault, Redis contract
+  vault.ts     Vault, InMemoryVault, RedisLike/AsyncVault types, hydrate
+  redis-vault.ts  pii-gate/redis: createRedisVault, loadVault, persistVault, withVault
   audit.ts     AuditLogger, JsonlAuditLogger, MemoryAuditLogger
   anthropic.ts wrapAnthropic
   core.ts      browser-safe entry (pii-gate/core)
